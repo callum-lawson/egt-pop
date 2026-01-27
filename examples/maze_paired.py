@@ -381,8 +381,8 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
     return checkpoint_manager
 #endregion
 
-def main(config=None, project="JAXUED_TEST"):
-    run = wandb.init(config=config, project=project, group=config["group_name"], tags=["PAIRED",])
+def main(config=None, project="egt-pop"):
+    run = wandb.init(config=config, project=project, entity="callum-lawson", group=config["group_name"], tags=["PAIRED",])
     config = wandb.config
     
     wandb.define_metric("num_updates")
@@ -681,7 +681,7 @@ if __name__=="__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", type=str, default="JAXUED_TEST")
+    parser.add_argument("--project", type=str, default="egt-pop")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     # === Train vs Eval ===

@@ -394,7 +394,7 @@ def compute_score(config, dones, values, max_returns, advantages):
     else:
         raise ValueError(f"Unknown score function: {config['score_function']}")
 
-def main(config=None, project="JAXUED_TEST"):
+def main(config=None, project="egt-pop"):
     tags = []
     if not config["exploratory_grad_updates"]:
         tags.append("robust")
@@ -402,7 +402,7 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("ACCEL")
     else:
         tags.append("PLR")
-    run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
+    run = wandb.init(config=config, project=project, entity="callum-lawson", group=config["run_name"], tags=tags)
     config = wandb.config
     
     wandb.define_metric("num_updates")
@@ -832,7 +832,7 @@ if __name__=="__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", type=str, default="JAXUED_TEST")
+    parser.add_argument("--project", type=str, default="egt-pop")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     # === Train vs Eval ===
