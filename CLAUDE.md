@@ -4,14 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-JaxUED is an Unsupervised Environment Design (UED) library in JAX. It provides single-file, understandable implementations of UED algorithms (DR, PLR, ACCEL, PAIRED) with a focus on easy modification and rapid prototyping.
+**egt-pop** is derived from [JaxUED](https://github.com/DramaCow/jaxued), an Unsupervised Environment Design (UED) library in JAX. The base library provides single-file, understandable implementations of UED algorithms (DR, PLR, ACCEL, PAIRED).
+
+This repo extends JaxUED with:
+- **New environments**: T-mazes and other environments (potentially based on [ReMiDi](https://github.com/Michael-Beukman/ReMiDi))
+- **New algorithms**: Modifications to PLR and PAIRED
+
+## Git Setup
+
+- `origin` → this repo (egt-pop)
+- `upstream` → original jaxued
+
+To pull upstream updates: `git fetch upstream && git merge upstream/main`
 
 ## Common Commands
 
-### Installation
+### Installation (local dev)
 ```bash
-pip install jaxued                    # Core package
-pip install "jaxued[examples]"        # With example dependencies
+pip install -e ".[examples]"
 ```
 
 ### Running Training Examples
