@@ -84,3 +84,30 @@ To add new environments: subclass `UnderspecifiedEnv` and replace the env initia
 - **vmapped parallelism**: Training vectorizes over many environments
 - **Single-file implementations**: Each algorithm is fully contained for readability
 - **Flax structs**: Use `@struct.dataclass` for JAX-compatible state objects
+
+## Style guide: Naming conventions
+
+### Compatibility
+- If the repo has established naming conventions (abbreviations, casing, prefixes/suffixes, domain terms), **follow them**.
+- Prefer **small, local** naming improvements; avoid broad renames that create large diffs unless necessary.
+
+### Defaults
+- Prefer **clear, literal names** over cleverness.
+- Optimize for readers: names should make the code read like a sentence.
+
+### Avoid
+- **Single-letter names** except tiny, conventional scopes (`i`, `j`, `_`).
+- **Abbreviations** unless they’re standard in the repo/domain (`id`, `url`, `db`).
+- Vague buckets: `utils`, `helpers`, `misc`, `common`, `manager`, `handler` (unless consistently used in the repo).
+
+### Prefer
+- Specific nouns for data: `user`, `invoice`, `request_payload`, `model_params`.
+- Specific verbs for functions: `parse_config`, `load_checkpoint`, `compute_loss`, `write_report`.
+- Boolean names that read naturally: `is_ready`, `has_permission`, `should_retry`, `needs_update`.
+- Names that encode **units** when ambiguity is likely: `timeout_seconds`, `interval_ms`, `size_bytes`.
+
+### When naming is hard
+- Treat it as a design smell:
+  - split responsibilities
+  - extract a function/class with a sharper purpose
+  - name the general concept plainly, and make specialized variants more specific.
