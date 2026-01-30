@@ -39,7 +39,7 @@ dependencies = [
 examples = [
     "distrax",
     "optax",
-    "orbax-checkpoint==0.5.3",
+    "orbax-checkpoint>=0.9.0",
     "orbax",
     "wandb",
     "pillow",
