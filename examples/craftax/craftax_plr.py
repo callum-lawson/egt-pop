@@ -522,7 +522,7 @@ def main(config=None, project="egt-pop"):
         i = 0
         frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
         frames = np.array(frames[:episode_length])
-        log_dict.update({f"animations/animation": wandb.Video(frames, fps=4)})
+        log_dict.update({f"animations/animation": wandb.Video(frames, fps=4, format="gif")})
         
         wandb.log(log_dict)
     def sample_random_level(rng):

@@ -397,7 +397,7 @@ def main(config=None, project="egt-pop"):
         for i, level_name in enumerate(config["eval_levels"]):
             frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
             frames = np.array(frames[:episode_length])
-            log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
+            log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4, format="gif")})
         
         wandb.log(log_dict)
     
