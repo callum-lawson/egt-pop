@@ -1,0 +1,39 @@
+# T-maze quick trial - 500 updates for testing
+# Run: python examples/tmaze_plr.py --config configs/tmaze_500steps.yaml --seed 0
+
+# Training
+num_updates: 500
+num_steps: 256
+num_train_envs: 32
+lr: 0.0001
+max_grad_norm: 0.5
+num_minibatches: 1
+gamma: 0.995
+epoch_ppo: 5
+clip_eps: 0.2
+gae_lambda: 0.98
+entropy_coeff: 0.001
+critic_coeff: 0.5
+
+# PLR (T-maze specific)
+score_function: MaxMC
+exploratory_grad_updates: false
+level_buffer_capacity: 2
+replay_prob: 0.8
+staleness_coeff: 0.3
+temperature: 0.3
+topk_k: 2
+minimum_fill_ratio: 1.0
+prioritization: rank
+buffer_duplicate_check: true
+
+# Environment
+agent_view_size: 5
+
+# Evaluation
+eval_freq: 50
+eval_num_attempts: 10
+
+# Checkpointing
+checkpoint_save_interval: 5
+max_number_of_checkpoints: 10

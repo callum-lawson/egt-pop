@@ -353,7 +353,7 @@ def compute_score(config, dones, values, max_returns, advantages):
         raise ValueError(f"Unknown score function: {config['score_function']}")
 
 def main(config=None, project="egt-pop"):
-    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["group_name"], tags=["DR",])
+    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["group_name"], name=config["run_name"], tags=["DR",])
     config = wandb.config
     
     wandb.define_metric("num_updates")
@@ -655,13 +655,12 @@ if __name__=="__main__":
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
     
-    config = vars(parser.parse_args())
+    from config_utils import load_config
+    config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])
-    config["group_name"] = ''.join([str(config[key]) for key in sorted([a.dest for a in parser._action_groups[2]._group_actions])])
 
     if config['mode'] == 'eval':
         os.environ['WANDB_MODE'] = 'disabled'
-    
-    # wandb.login()
+
     main(config, project=config["project"])

@@ -1,0 +1,28 @@
+# Maze DR (Domain Randomization) baseline - full training run
+# Run: python examples/maze_dr.py --config configs/maze_dr_baseline.yaml --seed 0
+
+# Training
+num_updates: 30000
+num_steps: 256
+num_train_envs: 32
+lr: 0.0001
+max_grad_norm: 0.5
+num_minibatches: 1
+gamma: 0.995
+epoch_ppo: 5
+clip_eps: 0.2
+gae_lambda: 0.98
+entropy_coeff: 0.001
+critic_coeff: 0.5
+
+# Environment
+agent_view_size: 5
+n_walls: 25
+
+# Evaluation
+eval_freq: 250
+eval_num_attempts: 10
+
+# Checkpointing
+checkpoint_save_interval: 2
+max_number_of_checkpoints: 60

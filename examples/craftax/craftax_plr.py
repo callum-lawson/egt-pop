@@ -480,7 +480,7 @@ def main(config=None, project="egt-pop"):
         tags.append("ACCEL")
     else:
         tags.append("PLR")
-    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["run_name"], tags=tags)
+    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["group_name"], name=config["run_name"], tags=tags)
     config = wandb.config
 
     wandb.define_metric("num_updates")
@@ -956,13 +956,15 @@ if __name__=="__main__":
     parser.add_argument("--num_eval_steps", type=int, default=2048)
     # === DR CONFIG ===
     
-    config = vars(parser.parse_args())
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from config_utils import load_config
+    config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"] * config["outer_rollout_steps"])
-    config["group_name"] = ''.join([str(config[key]) for key in sorted([a.dest for a in parser._action_groups[2]._group_actions])])
-    
+
     if config['mode'] == 'eval':
         os.environ['WANDB_MODE'] = 'disabled'
-    
+
     wandb.login()
     main(config, project=config["project"])

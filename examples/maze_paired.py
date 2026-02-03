@@ -382,7 +382,7 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
 #endregion
 
 def main(config=None, project="egt-pop"):
-    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["group_name"], tags=["PAIRED",])
+    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["group_name"], name=config["run_name"], tags=["PAIRED",])
     config = wandb.config
     
     wandb.define_metric("num_updates")
@@ -743,13 +743,12 @@ if __name__=="__main__":
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     
-    config = vars(parser.parse_args())
+    from config_utils import load_config
+    config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (2 * config["num_train_envs"] * config["student_num_steps"])
-    config["group_name"] = 'paired4_' + ''.join([str(config[key]) for key in sorted([a.dest for a in parser._action_groups[2]._group_actions])])
-    
+
     if config['mode'] == 'eval':
         os.environ['WANDB_MODE'] = 'disabled'
-    
-    # wandb.login()
+
     main(config, project=config["project"])

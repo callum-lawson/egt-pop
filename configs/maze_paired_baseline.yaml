@@ -1,0 +1,43 @@
+# Maze PAIRED baseline - full training run
+# Run: python examples/maze_paired.py --config configs/maze_paired_baseline.yaml --seed 0
+
+# Training
+num_updates: 30000
+num_train_envs: 32
+
+# Student hyperparams
+student_num_steps: 256
+student_lr: 0.0001
+student_max_grad_norm: 0.5
+student_num_minibatches: 1
+student_gamma: 0.995
+student_epoch_ppo: 5
+student_clip_eps: 0.2
+student_gae_lambda: 0.98
+student_entropy_coeff: 0.001
+student_critic_coeff: 0.5
+
+# Adversary hyperparams
+adv_random_z_dimension: 16
+adv_zero_out_random_z: false
+adv_num_steps: 50
+adv_lr: 0.0001
+adv_max_grad_norm: 0.5
+adv_num_minibatches: 1
+adv_gamma: 0.995
+adv_epoch_ppo: 5
+adv_clip_eps: 0.2
+adv_gae_lambda: 0.98
+adv_entropy_coeff: 0.001
+adv_critic_coeff: 0.5
+
+# Environment
+agent_view_size: 5
+
+# Evaluation
+eval_freq: 250
+eval_num_attempts: 10
+
+# Checkpointing
+checkpoint_save_interval: 2
+max_number_of_checkpoints: 60
