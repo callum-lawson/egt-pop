@@ -1,0 +1,31 @@
+# T-maze DR baseline - balanced distribution
+# Run: python examples/tmaze_dr.py --config configs/tmaze_dr_baseline.yaml --seed 0
+
+# Training (pilot defaults for fast iteration)
+num_updates: 2000
+num_steps: 256
+num_train_envs: 32
+lr: 0.0001
+max_grad_norm: 0.5
+num_minibatches: 1
+gamma: 0.995
+epoch_ppo: 5
+clip_eps: 0.2
+gae_lambda: 0.98
+entropy_coeff: 0.001
+critic_coeff: 0.5
+
+# DR config
+p_right: 0.5
+
+# Environment
+agent_view_size: 5
+
+# Evaluation sweep
+eval_freq: 100
+eval_num_attempts: 100
+sweep_p_rights: [0.0, 0.25, 0.5, 0.75, 1.0]
+
+# Checkpointing
+checkpoint_save_interval: 2
+max_number_of_checkpoints: 60
