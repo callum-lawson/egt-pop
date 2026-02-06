@@ -597,7 +597,7 @@ def main(config=None, project="egt-pop"):
         metrics['time_delta'] = curr_time - start_time
         log_eval(metrics)
         if config["checkpoint_save_interval"] > 0:
-            checkpoint_manager.save(eval_step, runner_state[1], args=ocp.args.StandardSave(runner_state[1]))
+            checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
     return runner_state[1]
 

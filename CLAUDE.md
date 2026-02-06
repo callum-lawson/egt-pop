@@ -19,9 +19,14 @@ To pull upstream updates: `git fetch upstream && git merge upstream/main`
 
 ## Common Commands
 
-### Installation (local dev)
+### Environment setup
+Create the venv with system Python (not conda) so it works in all execution
+contexts (terminal, Cursor, Codex, sandboxed agents):
 ```bash
-pip install -e ".[examples]"
+/usr/bin/python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -e ".[examples]"
+.venv/bin/pip install "jax[cuda12]"  # GPU support
 ```
 
 ### Running Training Examples
