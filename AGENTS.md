@@ -10,12 +10,22 @@ Runnable reference implementations are in `examples/` (for example, `maze_dr.py`
 in `configs/*.yaml`. Documentation source is in `docs/` with MkDocs config in `mkdocs.yml`. Runtime outputs typically go to `checkpoints/` and `results/`.
 
 ## Build, Test, and Development Commands
-- `python -m pip install -e ".[examples]"`: editable install with example dependencies.
-- `pytest -v -s`: run the full test suite.
-- `WANDB_MODE=disabled pytest -v -s`: run tests without Weights & Biases logging side effects.
+- `./.venv/bin/python -m pip install -e ".[examples]"`: editable install with example dependencies.
+- `./.venv/bin/python -m pytest -q`: quick test run.
+- `WANDB_MODE=disabled ./.venv/bin/python -m pytest -v -s`: run tests without Weights & Biases logging side effects.
 - `tox`: run tests across supported Python versions defined in `tox.ini`.
-- `python examples/maze_plr.py` (or other scripts in `examples/`): run training entrypoints.
+- `./.venv/bin/python examples/maze_plr.py` (or other scripts in `examples/`): run training entrypoints.
+- `./.venv/bin/python -m compileall <files...>`: syntax check specific files.
 - `mkdocs serve`: preview docs locally from `docs/`.
+
+## Python / Test Environment (Important)
+- Reuse the existing virtual environment at `./.venv`; do not recreate it.
+- Do not run `python`, `python3`, `pip`, or `pytest` from PATH.
+- Use explicit venv executables:
+- `./.venv/bin/python`
+- `./.venv/bin/python -m pip`
+- `./.venv/bin/python -m pytest` (or `./.venv/bin/pytest`)
+- If `pytest` is missing from the venv, install it with `./.venv/bin/python -m pip install pytest`.
 
 ## Coding Style & Naming Conventions
 Use Python 3.9+ with 4-space indentation and PEP 8-compatible formatting. Follow existing repository patterns: `snake_case` for functions/variables, `PascalCase` for classes,
