@@ -75,10 +75,10 @@ class CheckpointConfig:
 
 class PPOUpdateBatch(NamedTuple):
     obs: chex.ArrayTree
-    actions: chex.Array
-    dones: chex.Array
-    log_probs: chex.Array
-    values: chex.Array
+    action: chex.Array
+    done: chex.Array
+    log_prob: chex.Array
+    value: chex.Array
     targets: chex.Array
     advantages: chex.Array
 
@@ -320,16 +320,8 @@ def update_actor_critic_rnn(
     Returns:
         ((rng, train_state), losses) where losses = (loss, (l_vf, l_clip, entropy))
     """
-    last_dones = jnp.roll(batch.dones, 1, axis=0).at[0].set(False)
-    batch_with_last_dones = PPOUpdateBatch(
-        obs=batch.obs,
-        actions=batch.actions,
-        dones=last_dones,
-        log_probs=batch.log_probs,
-        values=batch.values,
-        targets=batch.targets,
-        advantages=batch.advantages,
-    )
+    last_done = jnp.roll(batch.done, 1, axis=0).at[0].set(False)
+    batch = batch._replace(done=last_done)
 
     clip_eps = hparams.clip_eps
     entropy_coeff = hparams.entropy_coeff
@@ -337,19 +329,19 @@ def update_actor_critic_rnn(
 
     def update_epoch(carry, _):
         def update_minibatch(train_state, minibatch):
-            init_hstate, obs, actions, last_dones, log_probs, values, targets, advantages = minibatch
+            init_hstate, obs, action, done, log_prob, value, targets, advantages = minibatch
 
             def loss_fn(params):
-                _, pi, values_pred = train_state.apply_fn(params, (obs, last_dones), init_hstate)
-                log_probs_pred = pi.log_prob(actions)
+                _, pi, value_pred = train_state.apply_fn(params, (obs, done), init_hstate)
+                log_prob_pred = pi.log_prob(action)
                 entropy = pi.entropy().mean()
 
-                ratio = jnp.exp(log_probs_pred - log_probs)
+                ratio = jnp.exp(log_prob_pred - log_prob)
                 A = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
                 l_clip = (-jnp.minimum(ratio * A, jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * A)).mean()
 
-                values_pred_clipped = values + (values_pred - values).clip(-clip_eps, clip_eps)
-                l_vf = 0.5 * jnp.maximum((values_pred - targets) ** 2, (values_pred_clipped - targets) ** 2).mean()
+                value_pred_clipped = value + (value_pred - value).clip(-clip_eps, clip_eps)
+                l_vf = 0.5 * jnp.maximum((value_pred - targets) ** 2, (value_pred_clipped - targets) ** 2).mean()
 
                 loss = l_clip + critic_coeff * l_vf - entropy_coeff * entropy
 
@@ -374,7 +366,7 @@ def update_actor_critic_rnn(
                 lambda x: jnp.take(x, permutation, axis=1)
                 .reshape(x.shape[0], n_minibatch, -1, *x.shape[2:])
                 .swapaxes(0, 1),
-                batch_with_last_dones,
+                batch,
             ),
         )
         train_state, losses = jax.lax.scan(update_minibatch, train_state, minibatches)
@@ -384,31 +376,26 @@ def update_actor_critic_rnn(
 
 
 def setup_checkpointing(
-    wandb_config,
     checkpoint_config: CheckpointConfig,
 ) -> ocp.CheckpointManager:
-    """Set up orbax checkpointing and save config to disk.
+    """Set up orbax checkpoint manager.
 
     Args:
-        wandb_config: Wandb config object
         checkpoint_config: Checkpointing settings
 
     Returns:
         Configured CheckpointManager
     """
-    overall_save_dir = os.path.join(
+    save_dir = os.path.join(
         os.getcwd(),
         "checkpoints",
         checkpoint_config.run_name,
         str(checkpoint_config.seed),
     )
-    os.makedirs(overall_save_dir, exist_ok=True)
-
-    with open(os.path.join(overall_save_dir, 'config.json'), 'w+') as f:
-        f.write(json.dumps(wandb_config.as_dict(), indent=True))
+    os.makedirs(save_dir, exist_ok=True)
 
     checkpoint_manager = ocp.CheckpointManager(
-        os.path.join(overall_save_dir, 'models'),
+        os.path.join(save_dir, 'models'),
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=checkpoint_config.checkpoint_save_interval,
             max_to_keep=checkpoint_config.max_number_of_checkpoints,
@@ -566,10 +553,10 @@ def train_step(
         train_state.last_hstate,
         PPOUpdateBatch(
             obs=traj.obs,
-            actions=traj.action,
-            dones=traj.done,
-            log_probs=traj.log_prob,
-            values=traj.value,
+            action=traj.action,
+            done=traj.done,
+            log_prob=traj.log_prob,
+            value=traj.value,
             targets=targets,
             advantages=advantages,
         ),
@@ -684,8 +671,10 @@ def train_and_eval_step(
 
 
 def eval_checkpoint(
-    og_config,
     *,
+    checkpoint_directory: str,
+    checkpoint_to_eval: int,
+    eval_config: EvalConfig,
     create_train_state_fn,
     eval_policy_fn,
 ):
@@ -694,7 +683,9 @@ def eval_checkpoint(
     Saves results to a .npz file in the results/ directory.
 
     Args:
-        og_config: Config dict with checkpoint_directory, checkpoint_to_eval, eval_num_attempts
+        checkpoint_directory: Path to checkpoint directory
+        checkpoint_to_eval: Step to evaluate, or -1 for latest
+        eval_config: Evaluation settings
         create_train_state_fn: JIT'd create_train_state (partial-applied)
         eval_policy_fn: Partially-applied eval_policy
     """
@@ -706,18 +697,26 @@ def eval_checkpoint(
         checkpoint_manager = ocp.CheckpointManager(os.path.join(os.getcwd(), checkpoint_directory, 'models'), ocp.PyTreeCheckpointer())
 
         train_state_og: TrainState = create_train_state_fn(rng_init)
-        step = checkpoint_manager.latest_step() if og_config['checkpoint_to_eval'] == -1 else og_config['checkpoint_to_eval']
+        step = checkpoint_manager.latest_step() if checkpoint_to_eval == -1 else checkpoint_to_eval
 
         loaded_checkpoint = checkpoint_manager.restore(step)
         params = loaded_checkpoint['params']
         train_state = train_state_og.replace(params=params)
         return train_state, loaded_config
 
-    train_state, loaded_config = load(rng_init, og_config['checkpoint_directory'])
-    states, cum_rewards, episode_lengths = jax.vmap(eval_policy_fn, (0, None))(jax.random.split(rng_eval, og_config["eval_num_attempts"]), train_state)
-    save_loc = og_config['checkpoint_directory'].replace('checkpoints', 'results')
+    train_state, loaded_config = load(rng_init, checkpoint_directory)
+    states, cum_rewards, episode_lengths = jax.vmap(eval_policy_fn, (0, None))(
+        jax.random.split(rng_eval, eval_config.eval_num_attempts), train_state,
+    )
+    save_loc = checkpoint_directory.replace('checkpoints', 'results')
     os.makedirs(save_loc, exist_ok=True)
-    np.savez_compressed(os.path.join(save_loc, 'results.npz'), states=np.asarray(states), cum_rewards=np.asarray(cum_rewards), episode_lengths=np.asarray(episode_lengths), levels=loaded_config['eval_levels'])
+    np.savez_compressed(
+        os.path.join(save_loc, 'results.npz'),
+        states=np.asarray(states),
+        cum_rewards=np.asarray(cum_rewards),
+        episode_lengths=np.asarray(episode_lengths),
+        levels=loaded_config['eval_levels'],
+    )
     return states, cum_rewards, episode_lengths
 
 
@@ -806,7 +805,9 @@ def main(config=None, project="egt-pop"):
 
     if wandb_config['mode'] == 'eval':
         return eval_checkpoint(
-            wandb_config,
+            checkpoint_directory=wandb_config['checkpoint_directory'],
+            checkpoint_to_eval=wandb_config['checkpoint_to_eval'],
+            eval_config=eval_config,
             create_train_state_fn=jit_create_train_state,
             eval_policy_fn=bound_eval_policy,
         )
@@ -818,7 +819,12 @@ def main(config=None, project="egt-pop"):
     runner_state = (rng_train, train_state)
 
     if checkpoint_config.checkpoint_save_interval > 0:
-        checkpoint_manager = setup_checkpointing(wandb_config, checkpoint_config)
+        checkpoint_manager = setup_checkpointing(checkpoint_config)
+        save_dir = os.path.join(
+            "checkpoints", checkpoint_config.run_name, str(checkpoint_config.seed)
+        )
+        with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+            json.dump(wandb_config.as_dict(), f, indent=2)
 
     for eval_step in range(train_loop_shape.num_updates // train_loop_shape.eval_freq):
         start_time = time.time()

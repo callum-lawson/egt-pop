@@ -167,10 +167,10 @@ def test_update_actor_critic_rnn(env_and_state):
     )
     batch_v2 = v2.PPOUpdateBatch(
         obs=obs,
-        actions=actions,
-        dones=dones,
-        log_probs=log_probs,
-        values=values,
+        action=actions,
+        done=dones,
+        log_prob=log_probs,
+        value=values,
         targets=targets,
         advantages=advantages,
     )
