@@ -1,0 +1,64 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+Core library code lives in `src/jaxued/`:
+- `environments/` for environment implementations (`maze/`, `tmaze/`, `gymnax/`)
+- `wrappers/` for auto-reset/replay wrappers
+- `level_sampler.py` and `traits/` for UED sampling and trait logic
+
+Runnable reference implementations are in `examples/` (for example, `maze_dr.py`, `maze_plr.py`, `maze_paired.py`, `tmaze_dr.py`). Test files are in `tests/`. Experiment presets are
+in `configs/*.yaml`. Documentation source is in `docs/` with MkDocs config in `mkdocs.yml`. Runtime outputs typically go to `checkpoints/` and `results/`.
+
+## Build, Test, and Development Commands
+- `python -m pip install -e ".[examples]"`: editable install with example dependencies.
+- `pytest -v -s`: run the full test suite.
+- `WANDB_MODE=disabled pytest -v -s`: run tests without Weights & Biases logging side effects.
+- `tox`: run tests across supported Python versions defined in `tox.ini`.
+- `python examples/maze_plr.py` (or other scripts in `examples/`): run training entrypoints.
+- `mkdocs serve`: preview docs locally from `docs/`.
+
+## Coding Style & Naming Conventions
+Use Python 3.9+ with 4-space indentation and PEP 8-compatible formatting. Follow existing repository patterns: `snake_case` for functions/variables, `PascalCase` for classes,
+descriptive names over abbreviations, and type hints for public APIs where practical. Keep implementations readable and local; avoid broad refactors unrelated to the change.
+
+## Testing Guidelines
+Testing uses `pytest` (with `pytest-cov` in `tox`). Add tests under `tests/` using `test_*.py` naming and `test_*` function names. For new behavior, include focused unit coverage and,
+when relevant, script-level regression checks similar to `tests/test_examples_kinda.py`. No strict coverage gate is configured; maintain or improve coverage in touched modules.
+
+## Commit & Pull Request Guidelines
+Recent history uses short, imperative commit subjects (for example: `Add ...`, `Fix ...`, `Make ...`). Keep subjects concise and scoped to one logical change. For PRs, include:
+- a clear summary of behavior changes,
+- linked issue/context,
+- test commands run and results,
+- config/CLI examples for reproducibility,
+- screenshots or logs when changing docs/visual outputs.
+
+## Python naming + comments
+
+### Compatibility
+- Follow the repo’s established naming conventions (abbreviations, casing, prefixes/suffixes, domain terms).
+- Prefer small, local improvements; avoid broad renames or reformatting unless necessary.
+
+### Defaults
+- Prefer clear, literal names over cleverness.
+- Make code read like a sentence.
+
+### Avoid
+- Single-letter names except tiny, conventional scopes (`i`, `j`, `_`).
+- Abbreviations unless standard in the repo/domain (`id`, `url`, `db`).
+- Vague buckets: `utils`, `helpers`, `misc`, `common`, `manager`, `handler` (unless consistently used in the repo).
+
+### Prefer
+- Specific nouns for data: `user`, `invoice`, `request_payload`, `model_params`.
+- Specific verbs for functions: `parse_config`, `load_checkpoint`, `compute_loss`, `write_report`.
+- Boolean names that read naturally: `is_ready`, `has_permission`, `should_retry`, `needs_update`.
+- Units when ambiguity is likely: `timeout_seconds`, `interval_ms`, `size_bytes`.
+
+### When naming is hard
+- Treat it as a design smell: split responsibilities, extract a sharper function/class, name the general concept plainly and specialize the variants.
+
+### Comments
+- Default: no inline comments.
+- Refactor for readability instead (names, constants, small functions, types).
+- Comment only for **why** (perf/constraints) or to cite an algorithm/math source.
+- Use docstrings for public APIs (usage + expectations), not internal narration.
