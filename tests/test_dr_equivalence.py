@@ -38,6 +38,20 @@ SMALL_CONFIG = {
     "n_walls": 25,
 }
 
+TRAIN_LOOP_SHAPE = v2.TrainLoopShape(
+    num_train_envs=SMALL_CONFIG["num_train_envs"],
+    num_steps=SMALL_CONFIG["num_steps"],
+    num_minibatches=SMALL_CONFIG["num_minibatches"],
+    epoch_ppo=SMALL_CONFIG["epoch_ppo"],
+    num_updates=SMALL_CONFIG["num_updates"],
+    eval_freq=1,
+)
+
+OPTIMIZER_CONFIG = v2.OptimizerConfig(
+    lr=SMALL_CONFIG["lr"],
+    max_grad_norm=SMALL_CONFIG["max_grad_norm"],
+)
+
 
 @pytest.fixture(scope="module")
 def env_and_state():
@@ -53,7 +67,8 @@ def env_and_state():
         env=env_wrapped,
         env_params=env_params,
         sample_random_level=sample_random_level,
-        wandb_config=SMALL_CONFIG,
+        train_loop_shape=TRAIN_LOOP_SHAPE,
+        optimizer_config=OPTIMIZER_CONFIG,
     ))(rng)
 
     return env_wrapped, env_params, train_state
@@ -150,8 +165,17 @@ def test_update_actor_critic_rnn(env_and_state):
         entropy_coeff=SMALL_CONFIG["entropy_coeff"],
         critic_coeff=SMALL_CONFIG["critic_coeff"],
     )
+    batch_v2 = v2.PPOUpdateBatch(
+        obs=obs,
+        actions=actions,
+        dones=dones,
+        log_probs=log_probs,
+        values=values,
+        targets=targets,
+        advantages=advantages,
+    )
     (rng2, ts2), losses2 = v2.update_actor_critic_rnn(
-        rng_update, train_state, train_state.last_hstate, batch, hparams,
+        rng_update, train_state, train_state.last_hstate, batch_v2, hparams,
         num_envs=num_envs, n_steps=num_steps,
         n_minibatch=SMALL_CONFIG["num_minibatches"],
         n_epochs=SMALL_CONFIG["epoch_ppo"],

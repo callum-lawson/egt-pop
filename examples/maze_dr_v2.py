@@ -1,7 +1,6 @@
 import os
 import json
 import time
-from dataclasses import dataclass
 from functools import partial
 from typing import NamedTuple, Sequence, Tuple
 
@@ -9,6 +8,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
+from flax import struct
 from flax.training.train_state import TrainState as BaseTrainState
 import flax.linen as nn
 from flax.linen.initializers import constant, orthogonal
@@ -34,13 +34,53 @@ class Trajectory(NamedTuple):
     info: dict
 
 
-@dataclass(frozen=True)
+@struct.dataclass
 class PPOHyperparams:
     gamma: float = 0.995
     gae_lambda: float = 0.98
     clip_eps: float = 0.2
     entropy_coeff: float = 1e-3
     critic_coeff: float = 0.5
+
+
+@struct.dataclass
+class TrainLoopShape:
+    num_train_envs: int
+    num_steps: int
+    num_minibatches: int
+    epoch_ppo: int
+    num_updates: int
+    eval_freq: int
+
+
+@struct.dataclass
+class OptimizerConfig:
+    lr: float
+    max_grad_norm: float
+
+
+@struct.dataclass
+class EvalConfig:
+    eval_num_attempts: int
+    eval_levels: Tuple[str, ...] = struct.field(pytree_node=False)
+
+
+@struct.dataclass
+class CheckpointConfig:
+    run_name: str = struct.field(pytree_node=False)
+    seed: int
+    checkpoint_save_interval: int
+    max_number_of_checkpoints: int
+
+
+class PPOUpdateBatch(NamedTuple):
+    obs: chex.ArrayTree
+    actions: chex.Array
+    dones: chex.Array
+    log_probs: chex.Array
+    values: chex.Array
+    targets: chex.Array
+    advantages: chex.Array
 
 
 class TrainState(BaseTrainState):
@@ -254,7 +294,7 @@ def update_actor_critic_rnn(
     rng: chex.PRNGKey,
     train_state: TrainState,
     init_hstate: chex.ArrayTree,
-    batch: chex.ArrayTree,
+    batch: PPOUpdateBatch,
     hparams: PPOHyperparams,
     *,
     num_envs: int,
@@ -269,7 +309,7 @@ def update_actor_critic_rnn(
         rng: PRNG key
         train_state: Current train state
         init_hstate: Initial RNN hidden state
-        batch: (obs, actions, dones, log_probs, values, targets, advantages)
+        batch: PPO update batch
         hparams: PPO hyperparameters (clip_eps, entropy_coeff, critic_coeff)
         num_envs: Number of environments
         n_steps: Number of rollout steps
@@ -280,9 +320,16 @@ def update_actor_critic_rnn(
     Returns:
         ((rng, train_state), losses) where losses = (loss, (l_vf, l_clip, entropy))
     """
-    obs, actions, dones, log_probs, values, targets, advantages = batch
-    last_dones = jnp.roll(dones, 1, axis=0).at[0].set(False)
-    batch = obs, actions, last_dones, log_probs, values, targets, advantages
+    last_dones = jnp.roll(batch.dones, 1, axis=0).at[0].set(False)
+    batch_with_last_dones = PPOUpdateBatch(
+        obs=batch.obs,
+        actions=batch.actions,
+        dones=last_dones,
+        log_probs=batch.log_probs,
+        values=batch.values,
+        targets=batch.targets,
+        advantages=batch.advantages,
+    )
 
     clip_eps = hparams.clip_eps
     entropy_coeff = hparams.entropy_coeff
@@ -327,7 +374,7 @@ def update_actor_critic_rnn(
                 lambda x: jnp.take(x, permutation, axis=1)
                 .reshape(x.shape[0], n_minibatch, -1, *x.shape[2:])
                 .swapaxes(0, 1),
-                batch,
+                batch_with_last_dones,
             ),
         )
         train_state, losses = jax.lax.scan(update_minibatch, train_state, minibatches)
@@ -336,46 +383,53 @@ def update_actor_critic_rnn(
     return jax.lax.scan(update_epoch, (rng, train_state), None, n_epochs)
 
 
-def setup_checkpointing(config: dict, train_state: TrainState, env: UnderspecifiedEnv, env_params: EnvParams) -> ocp.CheckpointManager:
+def setup_checkpointing(
+    wandb_config,
+    checkpoint_config: CheckpointConfig,
+) -> ocp.CheckpointManager:
     """Set up orbax checkpointing and save config to disk.
 
     Args:
-        config: Wandb config dict
-        train_state: Initial train state
-        env: Environment instance
-        env_params: Environment parameters
+        wandb_config: Wandb config object
+        checkpoint_config: Checkpointing settings
 
     Returns:
         Configured CheckpointManager
     """
-    overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
+    overall_save_dir = os.path.join(
+        os.getcwd(),
+        "checkpoints",
+        checkpoint_config.run_name,
+        str(checkpoint_config.seed),
+    )
     os.makedirs(overall_save_dir, exist_ok=True)
 
     with open(os.path.join(overall_save_dir, 'config.json'), 'w+') as f:
-        f.write(json.dumps(config.as_dict(), indent=True))
+        f.write(json.dumps(wandb_config.as_dict(), indent=True))
 
     checkpoint_manager = ocp.CheckpointManager(
         os.path.join(overall_save_dir, 'models'),
         options=ocp.CheckpointManagerOptions(
-            save_interval_steps=config['checkpoint_save_interval'],
-            max_to_keep=config['max_number_of_checkpoints'],
+            save_interval_steps=checkpoint_config.checkpoint_save_interval,
+            max_to_keep=checkpoint_config.max_number_of_checkpoints,
         )
     )
     return checkpoint_manager
 
 
-def log_eval(stats, *, wandb_config, env_renderer, env_params):
+def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig, env_renderer, env_params):
     """Log evaluation metrics and animations to wandb.
 
     Args:
         stats: Metrics dictionary from train_and_eval_step
-        wandb_config: Wandb config object
+        train_loop_shape: Training loop shape settings
+        eval_config: Evaluation settings
         env_renderer: MazeRenderer for generating animation frames
         env_params: Environment parameters
     """
     print(f"Logging update: {stats['update_count']}")
 
-    env_steps = stats["update_count"] * wandb_config["num_train_envs"] * wandb_config["num_steps"]
+    env_steps = stats["update_count"] * train_loop_shape.num_train_envs * train_loop_shape.num_steps
     log_dict = {
         "num_updates": stats["update_count"],
         "num_env_steps": env_steps,
@@ -384,9 +438,9 @@ def log_eval(stats, *, wandb_config, env_renderer, env_params):
 
     solve_rates = stats['eval_solve_rates']
     returns = stats["eval_returns"]
-    log_dict.update({f"solve_rate/{name}": solve_rate for name, solve_rate in zip(wandb_config["eval_levels"], solve_rates)})
+    log_dict.update({f"solve_rate/{name}": solve_rate for name, solve_rate in zip(eval_config.eval_levels, solve_rates)})
     log_dict.update({"solve_rate/mean": solve_rates.mean()})
-    log_dict.update({f"return/{name}": ret for name, ret in zip(wandb_config["eval_levels"], returns)})
+    log_dict.update({f"return/{name}": ret for name, ret in zip(eval_config.eval_levels, returns)})
     log_dict.update({"return/mean": returns.mean()})
     log_dict.update({"eval_ep_lengths/mean": stats['eval_ep_lengths'].mean()})
 
@@ -398,7 +452,7 @@ def log_eval(stats, *, wandb_config, env_renderer, env_params):
         "agent/entropy": entropy,
     })
 
-    for i, level_name in enumerate(wandb_config["eval_levels"]):
+    for i, level_name in enumerate(eval_config.eval_levels):
         frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
         frames = np.array(frames[:episode_length])
         log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4, format="gif")})
@@ -412,7 +466,8 @@ def create_train_state(
     env: UnderspecifiedEnv,
     env_params: EnvParams,
     sample_random_level,
-    wandb_config,
+    train_loop_shape: TrainLoopShape,
+    optimizer_config: OptimizerConfig,
 ) -> TrainState:
     """Create the initial TrainState with network, optimizer, and env state.
 
@@ -421,7 +476,8 @@ def create_train_state(
         env: Wrapped environment
         env_params: Environment parameters
         sample_random_level: Level generator function
-        wandb_config: Wandb config object
+        train_loop_shape: Training loop shape settings
+        optimizer_config: Optimizer settings
 
     Returns:
         Initialized TrainState
@@ -429,35 +485,39 @@ def create_train_state(
     def linear_schedule(count):
         frac = (
             1.0
-            - (count // (wandb_config["num_minibatches"] * wandb_config["epoch_ppo"]))
-            / wandb_config["num_updates"]
+            - (count // (train_loop_shape.num_minibatches * train_loop_shape.epoch_ppo))
+            / train_loop_shape.num_updates
         )
-        return wandb_config["lr"] * frac
+        return optimizer_config.lr * frac
 
     obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
     obs = jax.tree_util.tree_map(
-        lambda t: jnp.repeat(jnp.repeat(t[None, ...], wandb_config["num_train_envs"], axis=0)[None, ...], 256, axis=0),
+        lambda t: jnp.repeat(jnp.repeat(t[None, ...], train_loop_shape.num_train_envs, axis=0)[None, ...], 256, axis=0),
         obs,
     )
-    init_x = (obs, jnp.zeros((256, wandb_config["num_train_envs"])))
+    init_x = (obs, jnp.zeros((256, train_loop_shape.num_train_envs)))
     network = ActorCritic(env.action_space(env_params).n)
     rng, _rng = jax.random.split(rng)
-    network_params = network.init(_rng, init_x, ActorCritic.initialize_carry((wandb_config["num_train_envs"],)))
+    network_params = network.init(_rng, init_x, ActorCritic.initialize_carry((train_loop_shape.num_train_envs,)))
     tx = optax.chain(
-        optax.clip_by_global_norm(wandb_config["max_grad_norm"]),
+        optax.clip_by_global_norm(optimizer_config.max_grad_norm),
         optax.adam(learning_rate=linear_schedule, eps=1e-5),
     )
 
     rng_levels, rng_reset = jax.random.split(rng)
-    new_levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, wandb_config["num_train_envs"]))
-    init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, wandb_config["num_train_envs"]), new_levels, env_params)
+    new_levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, train_loop_shape.num_train_envs))
+    init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
+        jax.random.split(rng_reset, train_loop_shape.num_train_envs),
+        new_levels,
+        env_params,
+    )
 
     return TrainState.create(
         apply_fn=network.apply,
         params=network_params,
         tx=tx,
         update_count=0,
-        last_hstate=ActorCritic.initialize_carry((wandb_config["num_train_envs"],)),
+        last_hstate=ActorCritic.initialize_carry((train_loop_shape.num_train_envs,)),
         last_obs=init_obs,
         last_env_state=init_env_state,
     )
@@ -470,7 +530,7 @@ def train_step(
     hparams: PPOHyperparams,
     env: UnderspecifiedEnv,
     env_params: EnvParams,
-    wandb_config,
+    train_loop_shape: TrainLoopShape,
 ):
     """One training step: sample trajectories, compute GAE, update policy.
 
@@ -480,7 +540,7 @@ def train_step(
         hparams: PPO hyperparameters
         env: Environment instance
         env_params: Environment parameters
-        wandb_config: Wandb config object
+        train_loop_shape: Training loop shape settings
 
     Returns:
         ((rng, train_state), metrics)
@@ -495,8 +555,8 @@ def train_step(
         train_state.last_env_state,
         env=env,
         env_params=env_params,
-        num_envs=wandb_config["num_train_envs"],
-        max_episode_length=wandb_config["num_steps"],
+        num_envs=train_loop_shape.num_train_envs,
+        max_episode_length=train_loop_shape.num_steps,
     )
     advantages, targets = compute_gae(hparams, last_value, traj)
 
@@ -504,12 +564,20 @@ def train_step(
         rng,
         train_state,
         train_state.last_hstate,
-        (traj.obs, traj.action, traj.done, traj.log_prob, traj.value, targets, advantages),
+        PPOUpdateBatch(
+            obs=traj.obs,
+            actions=traj.action,
+            dones=traj.done,
+            log_probs=traj.log_prob,
+            values=traj.value,
+            targets=targets,
+            advantages=advantages,
+        ),
         hparams,
-        num_envs=wandb_config["num_train_envs"],
-        n_steps=wandb_config["num_steps"],
-        n_minibatch=wandb_config["num_minibatches"],
-        n_epochs=wandb_config["epoch_ppo"],
+        num_envs=train_loop_shape.num_train_envs,
+        n_steps=train_loop_shape.num_steps,
+        n_minibatch=train_loop_shape.num_minibatches,
+        n_epochs=train_loop_shape.epoch_ppo,
         update_grad=True,
     )
 
@@ -573,7 +641,8 @@ def train_and_eval_step(
     eval_policy_fn,
     env_renderer,
     env_params: EnvParams,
-    wandb_config,
+    train_loop_shape: TrainLoopShape,
+    eval_config: EvalConfig,
 ):
     """Run eval_freq training steps then evaluate the policy.
 
@@ -584,15 +653,19 @@ def train_and_eval_step(
         eval_policy_fn: Partially-applied eval_policy
         env_renderer: MazeRenderer for animation frames
         env_params: Environment parameters
-        wandb_config: Wandb config object
+        train_loop_shape: Training loop shape settings
+        eval_config: Evaluation settings
 
     Returns:
         ((rng, train_state), metrics)
     """
-    (rng, train_state), metrics = jax.lax.scan(train_step_fn, runner_state, None, wandb_config["eval_freq"])
+    (rng, train_state), metrics = jax.lax.scan(train_step_fn, runner_state, None, train_loop_shape.eval_freq)
 
     rng, rng_eval = jax.random.split(rng)
-    states, cum_rewards, episode_lengths = jax.vmap(eval_policy_fn, (0, None))(jax.random.split(rng_eval, wandb_config["eval_num_attempts"]), train_state)
+    states, cum_rewards, episode_lengths = jax.vmap(eval_policy_fn, (0, None))(
+        jax.random.split(rng_eval, eval_config.eval_num_attempts),
+        train_state,
+    )
 
     eval_solve_rates = jnp.where(cum_rewards > 0, 1., 0.).mean(axis=0)
     eval_returns = cum_rewards.mean(axis=0)
@@ -667,6 +740,28 @@ def main(config=None, project="egt-pop"):
         entropy_coeff=wandb_config["entropy_coeff"],
         critic_coeff=wandb_config["critic_coeff"],
     )
+    train_loop_shape = TrainLoopShape(
+        num_train_envs=wandb_config["num_train_envs"],
+        num_steps=wandb_config["num_steps"],
+        num_minibatches=wandb_config["num_minibatches"],
+        epoch_ppo=wandb_config["epoch_ppo"],
+        num_updates=wandb_config["num_updates"],
+        eval_freq=wandb_config["eval_freq"],
+    )
+    optimizer_config = OptimizerConfig(
+        lr=wandb_config["lr"],
+        max_grad_norm=wandb_config["max_grad_norm"],
+    )
+    eval_config = EvalConfig(
+        eval_num_attempts=wandb_config["eval_num_attempts"],
+        eval_levels=tuple(wandb_config["eval_levels"]),
+    )
+    checkpoint_config = CheckpointConfig(
+        run_name=wandb_config["run_name"],
+        seed=wandb_config["seed"],
+        checkpoint_save_interval=wandb_config["checkpoint_save_interval"],
+        max_number_of_checkpoints=wandb_config["max_number_of_checkpoints"],
+    )
 
     env = Maze(max_height=13, max_width=13, agent_view_size=wandb_config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -680,14 +775,15 @@ def main(config=None, project="egt-pop"):
         env=env,
         env_params=env_params,
         sample_random_level=sample_random_level,
-        wandb_config=wandb_config,
+        train_loop_shape=train_loop_shape,
+        optimizer_config=optimizer_config,
     ))
 
     bound_eval_policy = partial(
         eval_policy,
         eval_env=eval_env,
         env_params=env_params,
-        eval_levels=wandb_config["eval_levels"],
+        eval_levels=eval_config.eval_levels,
     )
 
     bound_train_step = partial(
@@ -695,7 +791,7 @@ def main(config=None, project="egt-pop"):
         hparams=hparams,
         env=env,
         env_params=env_params,
-        wandb_config=wandb_config,
+        train_loop_shape=train_loop_shape,
     )
 
     jit_train_and_eval_step = jax.jit(partial(
@@ -704,7 +800,8 @@ def main(config=None, project="egt-pop"):
         eval_policy_fn=bound_eval_policy,
         env_renderer=env_renderer,
         env_params=env_params,
-        wandb_config=wandb_config,
+        train_loop_shape=train_loop_shape,
+        eval_config=eval_config,
     ))
 
     if wandb_config['mode'] == 'eval':
@@ -720,16 +817,22 @@ def main(config=None, project="egt-pop"):
     train_state = jit_create_train_state(rng_init)
     runner_state = (rng_train, train_state)
 
-    if wandb_config["checkpoint_save_interval"] > 0:
-        checkpoint_manager = setup_checkpointing(wandb_config, train_state, env, env_params)
+    if checkpoint_config.checkpoint_save_interval > 0:
+        checkpoint_manager = setup_checkpointing(wandb_config, checkpoint_config)
 
-    for eval_step in range(wandb_config["num_updates"] // wandb_config["eval_freq"]):
+    for eval_step in range(train_loop_shape.num_updates // train_loop_shape.eval_freq):
         start_time = time.time()
         runner_state, metrics = jit_train_and_eval_step(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
-        log_eval(metrics, wandb_config=wandb_config, env_renderer=env_renderer, env_params=env_params)
-        if wandb_config["checkpoint_save_interval"] > 0:
+        log_eval(
+            metrics,
+            train_loop_shape=train_loop_shape,
+            eval_config=eval_config,
+            env_renderer=env_renderer,
+            env_params=env_params,
+        )
+        if checkpoint_config.checkpoint_save_interval > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
 
