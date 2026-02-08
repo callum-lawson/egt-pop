@@ -22,6 +22,7 @@ from jaxued.environments.maze import Level, make_level_generator
 from jaxued.utils import max_mc, positive_value_loss
 from jaxued.wrappers import AutoResetWrapper
 import chex
+from config_utils import struct_from_dict
 
 
 class Trajectory(NamedTuple):
@@ -732,35 +733,14 @@ def main(config=None, project="egt-pop"):
     wandb.define_metric("return/*", step_metric="num_updates")
     wandb.define_metric("eval_ep_lengths/*", step_metric="num_updates")
 
-    hparams = PPOHyperparams(
-        gamma=wandb_config["gamma"],
-        gae_lambda=wandb_config["gae_lambda"],
-        clip_eps=wandb_config["clip_eps"],
-        entropy_coeff=wandb_config["entropy_coeff"],
-        critic_coeff=wandb_config["critic_coeff"],
-    )
-    train_loop_shape = TrainLoopShape(
-        num_train_envs=wandb_config["num_train_envs"],
-        num_steps=wandb_config["num_steps"],
-        num_minibatches=wandb_config["num_minibatches"],
-        epoch_ppo=wandb_config["epoch_ppo"],
-        num_updates=wandb_config["num_updates"],
-        eval_freq=wandb_config["eval_freq"],
-    )
-    optimizer_config = OptimizerConfig(
-        lr=wandb_config["lr"],
-        max_grad_norm=wandb_config["max_grad_norm"],
-    )
-    eval_config = EvalConfig(
-        eval_num_attempts=wandb_config["eval_num_attempts"],
-        eval_levels=tuple(wandb_config["eval_levels"]),
-    )
-    checkpoint_config = CheckpointConfig(
-        run_name=wandb_config["run_name"],
-        seed=wandb_config["seed"],
-        checkpoint_save_interval=wandb_config["checkpoint_save_interval"],
-        max_number_of_checkpoints=wandb_config["max_number_of_checkpoints"],
-    )
+    flat_config = dict(wandb_config)
+    flat_config["eval_levels"] = tuple(flat_config["eval_levels"])
+
+    hparams = struct_from_dict(PPOHyperparams, flat_config)
+    train_loop_shape = struct_from_dict(TrainLoopShape, flat_config)
+    optimizer_config = struct_from_dict(OptimizerConfig, flat_config)
+    eval_config = struct_from_dict(EvalConfig, flat_config)
+    checkpoint_config = struct_from_dict(CheckpointConfig, flat_config)
 
     env = Maze(max_height=13, max_width=13, agent_view_size=wandb_config["agent_view_size"], normalize_obs=True)
     eval_env = env
