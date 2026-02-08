@@ -9,6 +9,23 @@ import sys
 from pathlib import Path
 
 
+def struct_from_dict(cls, d):
+    """Construct a Flax struct dataclass from a flat dict.
+
+    Extracts only the keys that match field names in ``cls``,
+    ignoring everything else.
+
+    Args:
+        cls: A ``@struct.dataclass`` class
+        d: Flat dict (e.g. wandb config)
+
+    Returns:
+        An instance of ``cls``
+    """
+    field_names = {f.name for f in cls.__dataclass_fields__.values()}
+    return cls(**{k: d[k] for k in field_names if k in d})
+
+
 def load_config(parser):
     """Load config from YAML file with CLI overrides.
 
