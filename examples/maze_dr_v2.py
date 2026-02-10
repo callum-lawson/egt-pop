@@ -302,7 +302,8 @@ def evaluate_rnn(
         (states, rewards, episode_lengths) with shapes
         (NUM_STEPS, NUM_LEVELS, ...), (NUM_STEPS, NUM_LEVELS), (NUM_LEVELS,)
     """
-    n_levels = jax.tree_util.tree_flatten(init_obs)[0][0].shape[0]
+    first_obs_leaf = jax.tree_util.tree_leaves(init_obs)[0]
+    n_levels = first_obs_leaf.shape[0]
 
     def step(carry, _):
         rng, rollout_state, mask, episode_length = carry
@@ -385,8 +386,11 @@ def update_actor_critic_rnn(
                 entropy = pi.entropy().mean()
 
                 ratio = jnp.exp(log_prob_pred - log_prob)
-                A = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
-                l_clip = (-jnp.minimum(ratio * A, jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * A)).mean()
+                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+                unclipped_objective = ratio * normalized_advantages
+                clipped_ratio = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps)
+                clipped_objective = clipped_ratio * normalized_advantages
+                l_clip = -jnp.minimum(unclipped_objective, clipped_objective).mean()
 
                 value_pred_clipped = value + (value_pred - value).clip(-clip_eps, clip_eps)
                 l_vf = 0.5 * jnp.maximum((value_pred - targets) ** 2, (value_pred_clipped - targets) ** 2).mean()
@@ -404,18 +408,32 @@ def update_actor_critic_rnn(
         rng, train_state = carry
         rng, rng_perm = jax.random.split(rng)
         permutation = jax.random.permutation(rng_perm, n_envs)
+
+        shuffled_init_hstate = jax.tree_util.tree_map(
+            lambda x: jnp.take(x, permutation, axis=0),
+            init_hstate,
+        )
+        minibatched_init_hstate = jax.tree_util.tree_map(
+            lambda x: x.reshape(n_minibatches, -1, *x.shape[1:]),
+            shuffled_init_hstate,
+        )
+
+        shuffled_batch = jax.tree_util.tree_map(
+            lambda x: jnp.take(x, permutation, axis=1),
+            batch,
+        )
+        reshaped_batch = jax.tree_util.tree_map(
+            lambda x: x.reshape(x.shape[0], n_minibatches, -1, *x.shape[2:]),
+            shuffled_batch,
+        )
+        minibatched_batch = jax.tree_util.tree_map(
+            lambda x: x.swapaxes(0, 1),
+            reshaped_batch,
+        )
+
         minibatches = (
-            jax.tree_util.tree_map(
-                lambda x: jnp.take(x, permutation, axis=0)
-                .reshape(n_minibatches, -1, *x.shape[1:]),
-                init_hstate,
-            ),
-            *jax.tree_util.tree_map(
-                lambda x: jnp.take(x, permutation, axis=1)
-                .reshape(x.shape[0], n_minibatches, -1, *x.shape[2:])
-                .swapaxes(0, 1),
-                batch,
-            ),
+            minibatched_init_hstate,
+            *minibatched_batch,
         )
         train_state, losses = jax.lax.scan(update_minibatch, train_state, minibatches)
         return (rng, train_state), losses
@@ -529,13 +547,13 @@ def create_train_state(
 
     obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
     init_sequence_length = network_config.lstm_features
-    obs = jax.tree_util.tree_map(
-        lambda t: jnp.repeat(
-            jnp.repeat(t[None, ...], train_loop_shape.n_train_envs, axis=0)[None, ...],
-            init_sequence_length,
-            axis=0,
-        ),
+    obs_for_env_batch = jax.tree_util.tree_map(
+        lambda t: jnp.repeat(t[None, ...], train_loop_shape.n_train_envs, axis=0),
         obs,
+    )
+    obs = jax.tree_util.tree_map(
+        lambda t: jnp.repeat(t[None, ...], init_sequence_length, axis=0),
+        obs_for_env_batch,
     )
     init_x = (obs, jnp.zeros((init_sequence_length, train_loop_shape.n_train_envs)))
     network = ActorCritic(env.action_space(env_params).n, network_config=network_config)
@@ -555,8 +573,9 @@ def create_train_state(
 
     rng_levels, rng_reset = jax.random.split(rng)
     new_levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, train_loop_shape.n_train_envs))
+    reset_keys = jax.random.split(rng_reset, train_loop_shape.n_train_envs)
     init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
-        jax.random.split(rng_reset, train_loop_shape.n_train_envs),
+        reset_keys,
         new_levels,
         env_params,
     )
@@ -671,7 +690,12 @@ def eval_policy(
     rng, rng_reset = jax.random.split(rng)
     levels = Level.load_prefabs(eval_levels)
     n_levels = len(eval_levels)
-    init_obs, init_env_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(jax.random.split(rng_reset, n_levels), levels, env_params)
+    reset_keys = jax.random.split(rng_reset, n_levels)
+    init_obs, init_env_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
+        reset_keys,
+        levels,
+        env_params,
+    )
     states, rewards, episode_lengths = evaluate_rnn(
         rng,
         train_state,
@@ -788,7 +812,14 @@ def eval_checkpoint(
 
 
 def main(config=None, project="egt-pop"):
-    run = wandb.init(config=config, project=project, entity=config["entity"], group=config["group_name"], name=config["run_name"], tags=["DR"])
+    run = wandb.init(
+        config=config,
+        project=project,
+        entity=config["entity"],
+        group=config["group_name"],
+        name=config["run_name"],
+        tags=["DR"],
+    )
     wandb_config = wandb.config
 
     wandb.define_metric("n_updates")
