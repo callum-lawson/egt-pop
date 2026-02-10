@@ -22,11 +22,11 @@ from jaxued.wrappers import AutoResetWrapper
 
 
 SMALL_CONFIG = {
-    "num_train_envs": 4,
-    "num_steps": 8,
-    "num_minibatches": 1,
-    "epoch_ppo": 2,
-    "num_updates": 10,
+    "n_train_envs": 4,
+    "n_steps": 8,
+    "n_minibatches": 1,
+    "n_ppo_epochs": 2,
+    "n_updates": 10,
     "lr": 1e-4,
     "max_grad_norm": 0.5,
     "gamma": 0.995,
@@ -39,11 +39,11 @@ SMALL_CONFIG = {
 }
 
 TRAIN_LOOP_SHAPE = v2.TrainLoopShape(
-    num_train_envs=SMALL_CONFIG["num_train_envs"],
-    num_steps=SMALL_CONFIG["num_steps"],
-    num_minibatches=SMALL_CONFIG["num_minibatches"],
-    epoch_ppo=SMALL_CONFIG["epoch_ppo"],
-    num_updates=SMALL_CONFIG["num_updates"],
+    n_train_envs=SMALL_CONFIG["n_train_envs"],
+    n_steps=SMALL_CONFIG["n_steps"],
+    n_minibatches=SMALL_CONFIG["n_minibatches"],
+    n_ppo_epochs=SMALL_CONFIG["n_ppo_epochs"],
+    n_updates=SMALL_CONFIG["n_updates"],
     eval_freq=1,
 )
 
@@ -77,12 +77,12 @@ def env_and_state():
 def test_compute_gae():
     """GAE computation produces identical results with both signatures."""
     rng = jax.random.PRNGKey(0)
-    num_steps, num_envs = 16, 8
+    n_steps, n_envs = 16, 8
     keys = jax.random.split(rng, 4)
-    values = jax.random.normal(keys[0], (num_steps, num_envs))
-    rewards = jax.random.normal(keys[1], (num_steps, num_envs))
-    dones = jax.random.bernoulli(keys[2], 0.1, (num_steps, num_envs)).astype(jnp.float32)
-    last_value = jax.random.normal(keys[3], (num_envs,))
+    values = jax.random.normal(keys[0], (n_steps, n_envs))
+    rewards = jax.random.normal(keys[1], (n_steps, n_envs))
+    dones = jax.random.bernoulli(keys[2], 0.1, (n_steps, n_envs)).astype(jnp.float32)
+    last_value = jax.random.normal(keys[3], (n_envs,))
 
     gamma, gae_lambda = 0.995, 0.98
 
@@ -103,20 +103,20 @@ def test_sample_trajectories_rnn(env_and_state):
     """Trajectory sampling produces identical results with both signatures."""
     env, env_params, train_state = env_and_state
     rng = jax.random.PRNGKey(7)
-    num_envs = SMALL_CONFIG["num_train_envs"]
-    num_steps = SMALL_CONFIG["num_steps"]
+    n_envs = SMALL_CONFIG["n_train_envs"]
+    n_steps = SMALL_CONFIG["n_steps"]
 
     (_, _, _, _, _, last_value_1), traj1 = v1.sample_trajectories_rnn(
         rng, env, env_params, train_state,
         train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
-        num_envs, num_steps,
+        n_envs, n_steps,
     )
 
     (_, _, _, _, _, last_value_2), traj2 = v2.sample_trajectories_rnn(
         rng, train_state,
         train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
         env=env, env_params=env_params,
-        num_envs=num_envs, max_episode_length=num_steps,
+        n_envs=n_envs, max_episode_length=n_steps,
     )
 
     assert_allclose(np.array(last_value_1), np.array(last_value_2), rtol=1e-5)
@@ -135,15 +135,15 @@ def test_update_actor_critic_rnn(env_and_state):
     """PPO update produces identical losses and params with both signatures."""
     env, env_params, train_state = env_and_state
     rng = jax.random.PRNGKey(7)
-    num_envs = SMALL_CONFIG["num_train_envs"]
-    num_steps = SMALL_CONFIG["num_steps"]
+    n_envs = SMALL_CONFIG["n_train_envs"]
+    n_steps = SMALL_CONFIG["n_steps"]
 
     # Generate a shared rollout via v1 (already proven equivalent above)
     (_, _, _, _, _, last_value), (obs, actions, rewards, dones, log_probs, values, info) = \
         v1.sample_trajectories_rnn(
             rng, env, env_params, train_state,
             train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
-            num_envs, num_steps,
+            n_envs, n_steps,
         )
     advantages, targets = v1.compute_gae(
         SMALL_CONFIG["gamma"], SMALL_CONFIG["gae_lambda"],
@@ -155,8 +155,8 @@ def test_update_actor_critic_rnn(env_and_state):
 
     (rng1, ts1), losses1 = v1.update_actor_critic_rnn(
         rng_update, train_state, train_state.last_hstate, batch,
-        num_envs, num_steps,
-        SMALL_CONFIG["num_minibatches"], SMALL_CONFIG["epoch_ppo"],
+        n_envs, n_steps,
+        SMALL_CONFIG["n_minibatches"], SMALL_CONFIG["n_ppo_epochs"],
         SMALL_CONFIG["clip_eps"], SMALL_CONFIG["entropy_coeff"], SMALL_CONFIG["critic_coeff"],
     )
 
@@ -176,9 +176,9 @@ def test_update_actor_critic_rnn(env_and_state):
     )
     (rng2, ts2), losses2 = v2.update_actor_critic_rnn(
         rng_update, train_state, train_state.last_hstate, batch_v2, hparams,
-        num_envs=num_envs, n_steps=num_steps,
-        n_minibatch=SMALL_CONFIG["num_minibatches"],
-        n_epochs=SMALL_CONFIG["epoch_ppo"],
+        n_envs=n_envs, n_steps=n_steps,
+        n_minibatches=SMALL_CONFIG["n_minibatches"],
+        n_ppo_epochs=SMALL_CONFIG["n_ppo_epochs"],
     )
 
     loss1, (vf1, clip1, ent1) = losses1
