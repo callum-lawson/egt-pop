@@ -52,6 +52,8 @@ OPTIMIZER_CONFIG = v2.OptimizerConfig(
     max_grad_norm=SMALL_CONFIG["max_grad_norm"],
 )
 
+NETWORK_CONFIG = v2.NetworkConfig()
+
 
 @pytest.fixture(scope="module")
 def env_and_state():
@@ -69,6 +71,7 @@ def env_and_state():
         sample_random_level=sample_random_level,
         train_loop_shape=TRAIN_LOOP_SHAPE,
         optimizer_config=OPTIMIZER_CONFIG,
+        network_config=NETWORK_CONFIG,
     ))(rng)
 
     return env_wrapped, env_params, train_state

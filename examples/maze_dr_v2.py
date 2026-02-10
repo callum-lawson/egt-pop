@@ -74,6 +74,14 @@ class CheckpointConfig:
     max_number_of_checkpoints: int
 
 
+@struct.dataclass
+class NetworkConfig:
+    conv_filters: int = 16
+    direction_embed_dim: int = 5
+    hidden_dim: int = 32
+    lstm_features: int = 256
+
+
 class PPOUpdateBatch(NamedTuple):
     obs: chex.ArrayTree
     action: chex.Array
@@ -94,36 +102,62 @@ class TrainState(BaseTrainState):
 class ActorCritic(nn.Module):
     """Actor-critic with LSTM."""
     action_dim: Sequence[int]
+    network_config: NetworkConfig
 
     @nn.compact
     def __call__(self, inputs, hidden):
         obs, dones = inputs
 
-        img_embed = nn.Conv(16, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(obs.image)
+        img_embed = nn.Conv(
+            self.network_config.conv_filters,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+        )(obs.image)
         img_embed = img_embed.reshape(*img_embed.shape[:-3], -1)
         img_embed = nn.relu(img_embed)
 
         dir_embed = jax.nn.one_hot(obs.agent_dir, 4)
-        dir_embed = nn.Dense(5, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name="scalar_embed")(dir_embed)
+        dir_embed = nn.Dense(
+            self.network_config.direction_embed_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="scalar_embed",
+        )(dir_embed)
 
         embedding = jnp.append(img_embed, dir_embed, axis=-1)
 
-        hidden, embedding = ResetRNN(nn.OptimizedLSTMCell(features=256))((embedding, dones), initial_carry=hidden)
+        hidden, embedding = ResetRNN(
+            nn.OptimizedLSTMCell(features=self.network_config.lstm_features)
+        )((embedding, dones), initial_carry=hidden)
 
-        actor_mean = nn.Dense(32, kernel_init=orthogonal(2), bias_init=constant(0.0), name="actor0")(embedding)
+        actor_mean = nn.Dense(
+            self.network_config.hidden_dim,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor0",
+        )(embedding)
         actor_mean = nn.relu(actor_mean)
         actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="actor1")(actor_mean)
         pi = distrax.Categorical(logits=actor_mean)
 
-        critic = nn.Dense(32, kernel_init=orthogonal(2), bias_init=constant(0.0), name="critic0")(embedding)
+        critic = nn.Dense(
+            self.network_config.hidden_dim,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="critic0",
+        )(embedding)
         critic = nn.relu(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0), name="critic1")(critic)
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
     @staticmethod
-    def initialize_carry(batch_dims):
-        return nn.OptimizedLSTMCell(features=256).initialize_carry(jax.random.PRNGKey(0), (*batch_dims, 256))
+    def initialize_carry(batch_dims, lstm_features: int):
+        return nn.OptimizedLSTMCell(features=lstm_features).initialize_carry(
+            jax.random.PRNGKey(0),
+            (*batch_dims, lstm_features),
+        )
 
 
 def compute_gae(
@@ -456,6 +490,7 @@ def create_train_state(
     sample_random_level,
     train_loop_shape: TrainLoopShape,
     optimizer_config: OptimizerConfig,
+    network_config: NetworkConfig,
 ) -> TrainState:
     """Create the initial TrainState with network, optimizer, and env state.
 
@@ -466,6 +501,7 @@ def create_train_state(
         sample_random_level: Level generator function
         train_loop_shape: Training loop shape settings
         optimizer_config: Optimizer settings
+        network_config: Network architecture settings
 
     Returns:
         Initialized TrainState
@@ -479,14 +515,26 @@ def create_train_state(
         return optimizer_config.lr * frac
 
     obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
+    init_sequence_length = network_config.lstm_features
     obs = jax.tree_util.tree_map(
-        lambda t: jnp.repeat(jnp.repeat(t[None, ...], train_loop_shape.n_train_envs, axis=0)[None, ...], 256, axis=0),
+        lambda t: jnp.repeat(
+            jnp.repeat(t[None, ...], train_loop_shape.n_train_envs, axis=0)[None, ...],
+            init_sequence_length,
+            axis=0,
+        ),
         obs,
     )
-    init_x = (obs, jnp.zeros((256, train_loop_shape.n_train_envs)))
-    network = ActorCritic(env.action_space(env_params).n)
+    init_x = (obs, jnp.zeros((init_sequence_length, train_loop_shape.n_train_envs)))
+    network = ActorCritic(env.action_space(env_params).n, network_config=network_config)
     rng, _rng = jax.random.split(rng)
-    network_params = network.init(_rng, init_x, ActorCritic.initialize_carry((train_loop_shape.n_train_envs,)))
+    network_params = network.init(
+        _rng,
+        init_x,
+        ActorCritic.initialize_carry(
+            (train_loop_shape.n_train_envs,),
+            network_config.lstm_features,
+        ),
+    )
     tx = optax.chain(
         optax.clip_by_global_norm(optimizer_config.max_grad_norm),
         optax.adam(learning_rate=linear_schedule, eps=1e-5),
@@ -505,7 +553,10 @@ def create_train_state(
         params=network_params,
         tx=tx,
         update_count=0,
-        last_hstate=ActorCritic.initialize_carry((train_loop_shape.n_train_envs,)),
+        last_hstate=ActorCritic.initialize_carry(
+            (train_loop_shape.n_train_envs,),
+            network_config.lstm_features,
+        ),
         last_obs=init_obs,
         last_env_state=init_env_state,
     )
@@ -589,6 +640,7 @@ def eval_policy(
     eval_env: UnderspecifiedEnv,
     env_params: EnvParams,
     eval_levels: list,
+    network_config: NetworkConfig,
 ):
     """Evaluate the current policy on a set of named levels.
 
@@ -598,6 +650,7 @@ def eval_policy(
         eval_env: Unwrapped evaluation environment
         env_params: Environment parameters
         eval_levels: List of level name strings
+        network_config: Network architecture settings
 
     Returns:
         (states, cum_rewards, episode_lengths)
@@ -609,7 +662,7 @@ def eval_policy(
     states, rewards, episode_lengths = evaluate_rnn(
         rng,
         train_state,
-        ActorCritic.initialize_carry((n_levels,)),
+        ActorCritic.initialize_carry((n_levels,), network_config.lstm_features),
         init_obs,
         init_env_state,
         env=eval_env,
@@ -741,6 +794,7 @@ def main(config=None, project="egt-pop"):
     optimizer_config = struct_from_dict(OptimizerConfig, flat_config)
     eval_config = struct_from_dict(EvalConfig, flat_config)
     checkpoint_config = struct_from_dict(CheckpointConfig, flat_config)
+    network_config = struct_from_dict(NetworkConfig, flat_config)
 
     env = Maze(max_height=13, max_width=13, agent_view_size=wandb_config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -756,6 +810,7 @@ def main(config=None, project="egt-pop"):
         sample_random_level=sample_random_level,
         train_loop_shape=train_loop_shape,
         optimizer_config=optimizer_config,
+        network_config=network_config,
     ))
 
     bound_eval_policy = partial(
@@ -763,6 +818,7 @@ def main(config=None, project="egt-pop"):
         eval_env=eval_env,
         env_params=env_params,
         eval_levels=eval_config.eval_levels,
+        network_config=network_config,
     )
 
     bound_train_step = partial(
