@@ -92,6 +92,13 @@ class PPOUpdateBatch(NamedTuple):
     advantages: chex.Array
 
 
+class RolloutState(NamedTuple):
+    hstate: chex.ArrayTree
+    obs: Observation
+    env_state: EnvState
+    done: chex.Array
+
+
 class TrainState(BaseTrainState):
     update_count: int
     last_hstate: chex.ArrayTree
@@ -221,11 +228,11 @@ def sample_trajectories_rnn(
         ((rng, train_state, hstate, last_obs, last_env_state, last_value), traj)
     """
     def sample_step(carry, _):
-        rng, train_state, hstate, obs, env_state, last_done = carry
+        rng, train_state, rollout_state = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        x = jax.tree_util.tree_map(lambda t: t[None, ...], (obs, last_done))
-        hstate, pi, value = train_state.apply_fn(train_state.params, x, hstate)
+        x = jax.tree_util.tree_map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+        hstate, pi, value = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
         action = pi.sample(seed=rng_action)
         log_prob = pi.log_prob(action)
         value, action, log_prob = (
@@ -236,29 +243,36 @@ def sample_trajectories_rnn(
 
         next_obs, env_state, reward, done, info = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(jax.random.split(rng_step, n_envs), env_state, action, env_params)
+        )(jax.random.split(rng_step, n_envs), rollout_state.env_state, action, env_params)
 
-        carry = (rng, train_state, hstate, next_obs, env_state, done)
-        return carry, Trajectory(obs, action, reward, done, log_prob, value, info)
+        next_rollout_state = RolloutState(hstate, next_obs, env_state, done)
+        carry = (rng, train_state, next_rollout_state)
+        return carry, Trajectory(rollout_state.obs, action, reward, done, log_prob, value, info)
 
-    (rng, train_state, hstate, last_obs, last_env_state, last_done), traj = jax.lax.scan(
+    init_rollout_state = RolloutState(
+        init_hstate,
+        init_obs,
+        init_env_state,
+        jnp.zeros(n_envs, dtype=bool),
+    )
+    (rng, train_state, rollout_state), traj = jax.lax.scan(
         sample_step,
-        (
-            rng,
-            train_state,
-            init_hstate,
-            init_obs,
-            init_env_state,
-            jnp.zeros(n_envs, dtype=bool),
-        ),
+        (rng, train_state, init_rollout_state),
         None,
         length=max_episode_length,
     )
 
-    x = jax.tree_util.tree_map(lambda t: t[None, ...], (last_obs, last_done))
-    _, _, last_value = train_state.apply_fn(train_state.params, x, hstate)
+    x = jax.tree_util.tree_map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+    _, _, last_value = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
 
-    return (rng, train_state, hstate, last_obs, last_env_state, last_value.squeeze(0)), traj
+    return (
+        rng,
+        train_state,
+        rollout_state.hstate,
+        rollout_state.obs,
+        rollout_state.env_state,
+        last_value.squeeze(0),
+    ), traj
 
 
 def evaluate_rnn(
@@ -291,33 +305,32 @@ def evaluate_rnn(
     n_levels = jax.tree_util.tree_flatten(init_obs)[0][0].shape[0]
 
     def step(carry, _):
-        rng, hstate, obs, state, done, mask, episode_length = carry
+        rng, rollout_state, mask, episode_length = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        x = jax.tree_util.tree_map(lambda t: t[None, ...], (obs, done))
-        hstate, pi, _ = train_state.apply_fn(train_state.params, x, hstate)
+        x = jax.tree_util.tree_map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+        hstate, pi, _ = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
         action = pi.sample(seed=rng_action).squeeze(0)
 
         obs, next_state, reward, done, _ = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(jax.random.split(rng_step, n_levels), state, action, env_params)
+        )(jax.random.split(rng_step, n_levels), rollout_state.env_state, action, env_params)
 
         next_mask = mask & ~done
         episode_length += mask
 
-        return (rng, hstate, obs, next_state, done, next_mask, episode_length), (state, reward)
+        next_rollout_state = RolloutState(hstate, obs, next_state, done)
+        return (rng, next_rollout_state, next_mask, episode_length), (rollout_state.env_state, reward)
 
-    (_, _, _, _, _, _, episode_lengths), (states, rewards) = jax.lax.scan(
+    init_rollout_state = RolloutState(
+        init_hstate,
+        init_obs,
+        init_env_state,
+        jnp.zeros(n_levels, dtype=bool),
+    )
+    (_, _, _, episode_lengths), (states, rewards) = jax.lax.scan(
         step,
-        (
-            rng,
-            init_hstate,
-            init_obs,
-            init_env_state,
-            jnp.zeros(n_levels, dtype=bool),
-            jnp.ones(n_levels, dtype=bool),
-            jnp.zeros(n_levels, dtype=jnp.int32),
-        ),
+        (rng, init_rollout_state, jnp.ones(n_levels, dtype=bool), jnp.zeros(n_levels, dtype=jnp.int32)),
         None,
         length=max_episode_length,
     )
