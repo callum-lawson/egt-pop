@@ -2,7 +2,7 @@ import os
 import json
 import time
 from functools import partial
-from typing import NamedTuple, Sequence, Tuple
+from typing import Callable, NamedTuple, Sequence, Tuple
 
 import numpy as np
 import jax
@@ -121,6 +121,14 @@ class RuntimeFunctions(NamedTuple):
     jit_create_train_state: callable
     eval_policy_fn: callable
     jit_train_and_eval_step: callable
+
+
+class EnvComponents(NamedTuple):
+    env: UnderspecifiedEnv
+    eval_env: UnderspecifiedEnv
+    sample_random_level: Callable[[chex.PRNGKey], Level]
+    env_renderer: MazeRenderer
+    env_params: EnvParams
 
 
 class TrainState(BaseTrainState):
@@ -531,7 +539,7 @@ def parse_runtime_configs(flat_config: dict) -> RuntimeConfigs:
     )
 
 
-def create_env_components(flat_config: dict):
+def create_env_components(flat_config: dict) -> EnvComponents:
     env = Maze(
         max_height=13,
         max_width=13,
@@ -547,7 +555,13 @@ def create_env_components(flat_config: dict):
     env_renderer = MazeRenderer(env, tile_size=8)
     env = AutoResetWrapper(env, sample_random_level)
     env_params = env.default_params
-    return env, eval_env, sample_random_level, env_renderer, env_params
+    return EnvComponents(
+        env=env,
+        eval_env=eval_env,
+        sample_random_level=sample_random_level,
+        env_renderer=env_renderer,
+        env_params=env_params,
+    )
 
 
 def build_eval_metrics(stats, eval_levels: Tuple[str, ...]) -> dict:
@@ -621,18 +635,14 @@ def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig
 
 def build_runtime_functions(
     *,
-    env,
-    eval_env,
-    env_params,
-    sample_random_level,
-    env_renderer,
+    env_components: EnvComponents,
     runtime_configs: RuntimeConfigs,
 ) -> RuntimeFunctions:
     create_train_state_fn = partial(
         create_train_state,
-        env=env,
-        env_params=env_params,
-        sample_random_level=sample_random_level,
+        env=env_components.env,
+        env_params=env_components.env_params,
+        sample_random_level=env_components.sample_random_level,
         train_loop_shape=runtime_configs.train_loop_shape,
         optimizer_config=runtime_configs.optimizer_config,
         network_config=runtime_configs.network_config,
@@ -641,8 +651,8 @@ def build_runtime_functions(
 
     eval_policy_fn = partial(
         eval_policy,
-        eval_env=eval_env,
-        env_params=env_params,
+        eval_env=env_components.eval_env,
+        env_params=env_components.env_params,
         eval_levels=runtime_configs.eval_config.eval_levels,
         network_config=runtime_configs.network_config,
     )
@@ -650,8 +660,8 @@ def build_runtime_functions(
     train_step_fn = partial(
         train_step,
         hparams=runtime_configs.hparams,
-        env=env,
-        env_params=env_params,
+        env=env_components.env,
+        env_params=env_components.env_params,
         train_loop_shape=runtime_configs.train_loop_shape,
     )
 
@@ -659,8 +669,8 @@ def build_runtime_functions(
         train_and_eval_step,
         train_step_fn=train_step_fn,
         eval_policy_fn=eval_policy_fn,
-        env_renderer=env_renderer,
-        env_params=env_params,
+        env_renderer=env_components.env_renderer,
+        env_params=env_components.env_params,
         train_loop_shape=runtime_configs.train_loop_shape,
         eval_config=runtime_configs.eval_config,
     )
@@ -978,13 +988,9 @@ def main(config=None, project="egt-pop"):
 
     init_wandb(config=run_config, project=project)
 
-    env, eval_env, sample_random_level, env_renderer, env_params = create_env_components(run_config)
+    env_components = create_env_components(run_config)
     runtime_functions = build_runtime_functions(
-        env=env,
-        eval_env=eval_env,
-        env_params=env_params,
-        sample_random_level=sample_random_level,
-        env_renderer=env_renderer,
+        env_components=env_components,
         runtime_configs=runtime_configs,
     )
 
