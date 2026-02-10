@@ -743,7 +743,10 @@ if __name__=="__main__":
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     
-    from config_utils import load_config
+    try:
+        from examples.config_utils import load_config
+    except ModuleNotFoundError:
+        from config_utils import load_config
     config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (2 * config["num_train_envs"] * config["student_num_steps"])

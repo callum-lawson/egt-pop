@@ -740,7 +740,10 @@ if __name__=="__main__":
     group.add_argument("--p_right", type=float, default=0.5,
                        help="Probability that training levels have goal on right (env_trait)")
 
-    from config_utils import load_config
+    try:
+        from examples.config_utils import load_config
+    except ModuleNotFoundError:
+        from config_utils import load_config
     config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])

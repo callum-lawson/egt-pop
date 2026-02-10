@@ -1045,7 +1045,10 @@ if __name__=="__main__":
 
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from config_utils import load_config
+    try:
+        from examples.config_utils import load_config
+    except ModuleNotFoundError:
+        from config_utils import load_config
     config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])

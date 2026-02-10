@@ -22,7 +22,10 @@ from jaxued.environments.maze import Level, make_level_generator
 from jaxued.utils import max_mc, positive_value_loss
 from jaxued.wrappers import AutoResetWrapper
 import chex
-from config_utils import struct_from_dict
+try:
+    from examples.config_utils import struct_from_dict
+except ModuleNotFoundError:
+    from config_utils import struct_from_dict
 
 WANDB_STEP_METRIC = "n_updates"
 WANDB_METRIC_PATTERNS = (
@@ -1090,7 +1093,10 @@ if __name__ == "__main__":
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
 
-    from config_utils import load_config
+    try:
+        from examples.config_utils import load_config
+    except ModuleNotFoundError:
+        from config_utils import load_config
     config = load_config(parser)
 
     # Backward compatibility for YAML files that still use legacy v1 keys.

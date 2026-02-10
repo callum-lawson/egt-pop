@@ -896,7 +896,10 @@ if __name__=="__main__":
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
     
-    from config_utils import load_config
+    try:
+        from examples.config_utils import load_config
+    except ModuleNotFoundError:
+        from config_utils import load_config
     config = load_config(parser)
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])
