@@ -265,7 +265,7 @@ def sample_trajectories_rnn(
         rng, train_state, rollout_state = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        x = jax.tree_util.tree_map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+        x = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
         hstate, pi, value = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
         action = pi.sample(seed=rng_action)
         log_prob = pi.log_prob(action)
@@ -296,7 +296,7 @@ def sample_trajectories_rnn(
         length=max_episode_length,
     )
 
-    x = jax.tree_util.tree_map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+    x = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
     _, _, last_value = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
 
     return (
@@ -336,14 +336,14 @@ def evaluate_rnn(
         (states, rewards, episode_lengths) with shapes
         (NUM_STEPS, NUM_LEVELS, ...), (NUM_STEPS, NUM_LEVELS), (NUM_LEVELS,)
     """
-    first_obs_leaf = jax.tree_util.tree_leaves(init_obs)[0]
+    first_obs_leaf = jax.tree.leaves(init_obs)[0]
     n_levels = first_obs_leaf.shape[0]
 
     def step(carry, _):
         rng, rollout_state, mask, episode_length = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        x = jax.tree_util.tree_map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+        x = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
         hstate, pi, _ = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
         action = pi.sample(seed=rng_action).squeeze(0)
 
@@ -443,24 +443,24 @@ def update_actor_critic_rnn(
         rng, rng_perm = jax.random.split(rng)
         permutation = jax.random.permutation(rng_perm, n_envs)
 
-        shuffled_init_hstate = jax.tree_util.tree_map(
+        shuffled_init_hstate = jax.tree.map(
             lambda x: jnp.take(x, permutation, axis=0),
             init_hstate,
         )
-        minibatched_init_hstate = jax.tree_util.tree_map(
+        minibatched_init_hstate = jax.tree.map(
             lambda x: x.reshape(n_minibatches, -1, *x.shape[1:]),
             shuffled_init_hstate,
         )
 
-        shuffled_batch = jax.tree_util.tree_map(
+        shuffled_batch = jax.tree.map(
             lambda x: jnp.take(x, permutation, axis=1),
             batch,
         )
-        reshaped_batch = jax.tree_util.tree_map(
+        reshaped_batch = jax.tree.map(
             lambda x: x.reshape(x.shape[0], n_minibatches, -1, *x.shape[2:]),
             shuffled_batch,
         )
-        minibatched_batch = jax.tree_util.tree_map(
+        minibatched_batch = jax.tree.map(
             lambda x: x.swapaxes(0, 1),
             reshaped_batch,
         )
@@ -707,11 +707,11 @@ def create_train_state(
 
     obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
     init_sequence_length = network_config.lstm_features
-    obs_for_env_batch = jax.tree_util.tree_map(
+    obs_for_env_batch = jax.tree.map(
         lambda t: jnp.repeat(t[None, ...], train_loop_shape.n_train_envs, axis=0),
         obs,
     )
-    obs = jax.tree_util.tree_map(
+    obs = jax.tree.map(
         lambda t: jnp.repeat(t[None, ...], init_sequence_length, axis=0),
         obs_for_env_batch,
     )
@@ -813,7 +813,7 @@ def train_step(
     )
 
     metrics = {
-        "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
+        "losses": jax.tree.map(lambda x: x.mean(), losses),
     }
 
     train_state = train_state.replace(
@@ -908,7 +908,7 @@ def train_and_eval_step(
     eval_solve_rates = jnp.where(cum_rewards > 0, 1., 0.).mean(axis=0)
     eval_returns = cum_rewards.mean(axis=0)
 
-    states, episode_lengths = jax.tree_util.tree_map(lambda x: x[0], (states, episode_lengths))
+    states, episode_lengths = jax.tree.map(lambda x: x[0], (states, episode_lengths))
     images = jax.vmap(jax.vmap(env_renderer.render_state, (0, None)), (0, None))(states, env_params)
     frames = images.transpose(0, 1, 4, 2, 3)
 
