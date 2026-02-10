@@ -145,7 +145,12 @@ class ActorCritic(nn.Module):
             name="actor0",
         )(embedding)
         actor_mean = nn.relu(actor_mean)
-        actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="actor1")(actor_mean)
+        actor_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="actor1",
+        )(actor_mean)
         pi = distrax.Categorical(logits=actor_mean)
 
         critic = nn.Dense(
@@ -155,7 +160,12 @@ class ActorCritic(nn.Module):
             name="critic0",
         )(embedding)
         critic = nn.relu(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0), name="critic1")(critic)
+        critic = nn.Dense(
+            1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="critic1",
+        )(critic)
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
@@ -847,7 +857,7 @@ def main(config=None, project="egt-pop"):
     env = AutoResetWrapper(env, sample_random_level)
     env_params = env.default_params
 
-    jit_create_train_state = jax.jit(partial(
+    create_train_state_fn = partial(
         create_train_state,
         env=env,
         env_params=env_params,
@@ -855,7 +865,8 @@ def main(config=None, project="egt-pop"):
         train_loop_shape=train_loop_shape,
         optimizer_config=optimizer_config,
         network_config=network_config,
-    ))
+    )
+    jit_create_train_state = jax.jit(create_train_state_fn)
 
     bound_eval_policy = partial(
         eval_policy,
@@ -873,7 +884,7 @@ def main(config=None, project="egt-pop"):
         train_loop_shape=train_loop_shape,
     )
 
-    jit_train_and_eval_step = jax.jit(partial(
+    train_and_eval_step_fn = partial(
         train_and_eval_step,
         train_step_fn=bound_train_step,
         eval_policy_fn=bound_eval_policy,
@@ -881,7 +892,8 @@ def main(config=None, project="egt-pop"):
         env_params=env_params,
         train_loop_shape=train_loop_shape,
         eval_config=eval_config,
-    ))
+    )
+    jit_train_and_eval_step = jax.jit(train_and_eval_step_fn)
 
     if wandb_config['mode'] == 'eval':
         return eval_checkpoint(
