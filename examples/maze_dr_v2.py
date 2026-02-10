@@ -480,6 +480,27 @@ def setup_checkpointing(
     return checkpoint_manager
 
 
+def init_wandb(*, config: dict, project: str):
+    run = wandb.init(
+        config=config,
+        project=project,
+        entity=config["entity"],
+        group=config["group_name"],
+        name=config["run_name"],
+        tags=["DR"],
+    )
+
+    wandb.define_metric("n_updates")
+    wandb.define_metric("n_env_steps")
+    wandb.define_metric("solve_rate/*", step_metric="n_updates")
+    wandb.define_metric("level_sampler/*", step_metric="n_updates")
+    wandb.define_metric("agent/*", step_metric="n_updates")
+    wandb.define_metric("return/*", step_metric="n_updates")
+    wandb.define_metric("eval_ep_lengths/*", step_metric="n_updates")
+
+    return run
+
+
 def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig, env_renderer, env_params):
     """Log evaluation metrics and animations to wandb.
 
@@ -493,7 +514,7 @@ def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig
     print(f"Logging update: {stats['update_count']}")
 
     env_steps = stats["update_count"] * train_loop_shape.n_train_envs * train_loop_shape.n_steps
-    log_dict = {
+    general_metrics = {
         "n_updates": stats["update_count"],
         "n_env_steps": env_steps,
         "sps": env_steps / stats['time_delta'],
@@ -501,24 +522,36 @@ def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig
 
     solve_rates = stats['eval_solve_rates']
     returns = stats["eval_returns"]
-    log_dict.update({f"solve_rate/{name}": solve_rate for name, solve_rate in zip(eval_config.eval_levels, solve_rates)})
-    log_dict.update({"solve_rate/mean": solve_rates.mean()})
-    log_dict.update({f"return/{name}": ret for name, ret in zip(eval_config.eval_levels, returns)})
-    log_dict.update({"return/mean": returns.mean()})
-    log_dict.update({"eval_ep_lengths/mean": stats['eval_ep_lengths'].mean()})
+    solve_rate_metrics = {f"solve_rate/{name}": solve_rate for name, solve_rate in zip(eval_config.eval_levels, solve_rates)}
+    solve_rate_summary_metrics = {"solve_rate/mean": solve_rates.mean()}
+    return_metrics = {f"return/{name}": ret for name, ret in zip(eval_config.eval_levels, returns)}
+    return_summary_metrics = {"return/mean": returns.mean()}
+    eval_length_metrics = {"eval_ep_lengths/mean": stats['eval_ep_lengths'].mean()}
 
     loss, (critic_loss, actor_loss, entropy) = stats["losses"]
-    log_dict.update({
+    agent_metrics = {
         "agent/loss": loss,
         "agent/critic_loss": critic_loss,
         "agent/actor_loss": actor_loss,
         "agent/entropy": entropy,
-    })
+    }
 
+    animation_metrics = {}
     for i, level_name in enumerate(eval_config.eval_levels):
         frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
         frames = np.array(frames[:episode_length])
-        log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4, format="gif")})
+        animation_metrics[f"animations/{level_name}"] = wandb.Video(frames, fps=4, format="gif")
+
+    log_dict = {
+        **general_metrics,
+        **solve_rate_metrics,
+        **solve_rate_summary_metrics,
+        **return_metrics,
+        **return_summary_metrics,
+        **eval_length_metrics,
+        **agent_metrics,
+        **animation_metrics,
+    }
 
     wandb.log(log_dict)
 
@@ -822,25 +855,7 @@ def eval_checkpoint(
 
 
 def main(config=None, project="egt-pop"):
-    run = wandb.init(
-        config=config,
-        project=project,
-        entity=config["entity"],
-        group=config["group_name"],
-        name=config["run_name"],
-        tags=["DR"],
-    )
-    wandb_config = wandb.config
-
-    wandb.define_metric("n_updates")
-    wandb.define_metric("n_env_steps")
-    wandb.define_metric("solve_rate/*", step_metric="n_updates")
-    wandb.define_metric("level_sampler/*", step_metric="n_updates")
-    wandb.define_metric("agent/*", step_metric="n_updates")
-    wandb.define_metric("return/*", step_metric="n_updates")
-    wandb.define_metric("eval_ep_lengths/*", step_metric="n_updates")
-
-    flat_config = dict(wandb_config)
+    flat_config = dict(config)
     flat_config["eval_levels"] = tuple(flat_config["eval_levels"])
 
     hparams = struct_from_dict(PPOHyperparams, flat_config)
@@ -850,9 +865,11 @@ def main(config=None, project="egt-pop"):
     checkpoint_config = struct_from_dict(CheckpointConfig, flat_config)
     network_config = struct_from_dict(NetworkConfig, flat_config)
 
-    env = Maze(max_height=13, max_width=13, agent_view_size=wandb_config["agent_view_size"], normalize_obs=True)
+    run = init_wandb(config=flat_config, project=project)
+
+    env = Maze(max_height=13, max_width=13, agent_view_size=flat_config["agent_view_size"], normalize_obs=True)
     eval_env = env
-    sample_random_level = make_level_generator(env.max_height, env.max_width, wandb_config["n_walls"])
+    sample_random_level = make_level_generator(env.max_height, env.max_width, flat_config["n_walls"])
     env_renderer = MazeRenderer(env, tile_size=8)
     env = AutoResetWrapper(env, sample_random_level)
     env_params = env.default_params
@@ -895,16 +912,16 @@ def main(config=None, project="egt-pop"):
     )
     jit_train_and_eval_step = jax.jit(train_and_eval_step_fn)
 
-    if wandb_config['mode'] == 'eval':
+    if flat_config['mode'] == 'eval':
         return eval_checkpoint(
-            checkpoint_directory=wandb_config['checkpoint_directory'],
-            checkpoint_to_eval=wandb_config['checkpoint_to_eval'],
+            checkpoint_directory=flat_config['checkpoint_directory'],
+            checkpoint_to_eval=flat_config['checkpoint_to_eval'],
             eval_config=eval_config,
             create_train_state_fn=jit_create_train_state,
             eval_policy_fn=bound_eval_policy,
         )
 
-    rng = jax.random.PRNGKey(wandb_config["seed"])
+    rng = jax.random.PRNGKey(flat_config["seed"])
     rng_init, rng_train = jax.random.split(rng)
 
     train_state = jit_create_train_state(rng_init)
@@ -916,7 +933,7 @@ def main(config=None, project="egt-pop"):
             "checkpoints", checkpoint_config.run_name, str(checkpoint_config.seed)
         )
         with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-            json.dump(wandb_config.as_dict(), f, indent=2)
+            json.dump(flat_config, f, indent=2)
 
     for eval_step in range(train_loop_shape.n_updates // train_loop_shape.eval_freq):
         start_time = time.time()
