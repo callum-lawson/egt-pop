@@ -24,6 +24,15 @@ from jaxued.wrappers import AutoResetWrapper
 import chex
 from config_utils import struct_from_dict
 
+WANDB_STEP_METRIC = "n_updates"
+WANDB_METRIC_PATTERNS = (
+    "solve_rate/*",
+    "level_sampler/*",
+    "agent/*",
+    "return/*",
+    "eval_ep_lengths/*",
+)
+
 
 class Trajectory(NamedTuple):
     obs: chex.ArrayTree
@@ -97,6 +106,21 @@ class RolloutState(NamedTuple):
     obs: Observation
     env_state: EnvState
     done: chex.Array
+
+
+class RuntimeConfigs(NamedTuple):
+    hparams: PPOHyperparams
+    train_loop_shape: TrainLoopShape
+    optimizer_config: OptimizerConfig
+    eval_config: EvalConfig
+    checkpoint_config: CheckpointConfig
+    network_config: NetworkConfig
+
+
+class RuntimeFunctions(NamedTuple):
+    jit_create_train_state: callable
+    eval_policy_fn: callable
+    jit_train_and_eval_step: callable
 
 
 class TrainState(BaseTrainState):
@@ -481,7 +505,7 @@ def setup_checkpointing(
 
 
 def init_wandb(*, config: dict, project: str):
-    run = wandb.init(
+    wandb.init(
         config=config,
         project=project,
         entity=config["entity"],
@@ -490,26 +514,88 @@ def init_wandb(*, config: dict, project: str):
         tags=["DR"],
     )
 
-    wandb.define_metric("n_updates")
+    wandb.define_metric(WANDB_STEP_METRIC)
     wandb.define_metric("n_env_steps")
-    wandb.define_metric("solve_rate/*", step_metric="n_updates")
-    wandb.define_metric("level_sampler/*", step_metric="n_updates")
-    wandb.define_metric("agent/*", step_metric="n_updates")
-    wandb.define_metric("return/*", step_metric="n_updates")
-    wandb.define_metric("eval_ep_lengths/*", step_metric="n_updates")
-
-    return run
+    for metric_pattern in WANDB_METRIC_PATTERNS:
+        wandb.define_metric(metric_pattern, step_metric=WANDB_STEP_METRIC)
 
 
-def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig, env_renderer, env_params):
+def parse_runtime_configs(flat_config: dict) -> RuntimeConfigs:
+    return RuntimeConfigs(
+        hparams=struct_from_dict(PPOHyperparams, flat_config),
+        train_loop_shape=struct_from_dict(TrainLoopShape, flat_config),
+        optimizer_config=struct_from_dict(OptimizerConfig, flat_config),
+        eval_config=struct_from_dict(EvalConfig, flat_config),
+        checkpoint_config=struct_from_dict(CheckpointConfig, flat_config),
+        network_config=struct_from_dict(NetworkConfig, flat_config),
+    )
+
+
+def create_env_components(flat_config: dict):
+    env = Maze(
+        max_height=13,
+        max_width=13,
+        agent_view_size=flat_config["agent_view_size"],
+        normalize_obs=True,
+    )
+    eval_env = env
+    sample_random_level = make_level_generator(
+        env.max_height,
+        env.max_width,
+        flat_config["n_walls"],
+    )
+    env_renderer = MazeRenderer(env, tile_size=8)
+    env = AutoResetWrapper(env, sample_random_level)
+    env_params = env.default_params
+    return env, eval_env, sample_random_level, env_renderer, env_params
+
+
+def build_eval_metrics(stats, eval_levels: Tuple[str, ...]) -> dict:
+    solve_rates = stats['eval_solve_rates']
+    returns = stats["eval_returns"]
+    solve_rate_metrics = {
+        f"solve_rate/{name}": solve_rate
+        for name, solve_rate in zip(eval_levels, solve_rates)
+    }
+    return_metrics = {
+        f"return/{name}": ret
+        for name, ret in zip(eval_levels, returns)
+    }
+    return {
+        **solve_rate_metrics,
+        "solve_rate/mean": solve_rates.mean(),
+        **return_metrics,
+        "return/mean": returns.mean(),
+        "eval_ep_lengths/mean": stats['eval_ep_lengths'].mean(),
+    }
+
+
+def build_agent_metrics(stats) -> dict:
+    loss, (critic_loss, actor_loss, entropy) = stats["losses"]
+    return {
+        "agent/loss": loss,
+        "agent/critic_loss": critic_loss,
+        "agent/actor_loss": actor_loss,
+        "agent/entropy": entropy,
+    }
+
+
+def build_animation_metrics(stats, eval_levels: Tuple[str, ...]) -> dict:
+    animation_metrics = {}
+    for i, level_name in enumerate(eval_levels):
+        frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
+        frames = np.array(frames[:episode_length])
+        animation_metrics[f"animations/{level_name}"] = wandb.Video(frames, fps=4, format="gif")
+    return animation_metrics
+
+
+def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig):
     """Log evaluation metrics and animations to wandb.
 
     Args:
         stats: Metrics dictionary from train_and_eval_step
         train_loop_shape: Training loop shape settings
         eval_config: Evaluation settings
-        env_renderer: MazeRenderer for generating animation frames
-        env_params: Environment parameters
     """
     print(f"Logging update: {stats['update_count']}")
 
@@ -519,41 +605,72 @@ def log_eval(stats, *, train_loop_shape: TrainLoopShape, eval_config: EvalConfig
         "n_env_steps": env_steps,
         "sps": env_steps / stats['time_delta'],
     }
-
-    solve_rates = stats['eval_solve_rates']
-    returns = stats["eval_returns"]
-    solve_rate_metrics = {f"solve_rate/{name}": solve_rate for name, solve_rate in zip(eval_config.eval_levels, solve_rates)}
-    solve_rate_summary_metrics = {"solve_rate/mean": solve_rates.mean()}
-    return_metrics = {f"return/{name}": ret for name, ret in zip(eval_config.eval_levels, returns)}
-    return_summary_metrics = {"return/mean": returns.mean()}
-    eval_length_metrics = {"eval_ep_lengths/mean": stats['eval_ep_lengths'].mean()}
-
-    loss, (critic_loss, actor_loss, entropy) = stats["losses"]
-    agent_metrics = {
-        "agent/loss": loss,
-        "agent/critic_loss": critic_loss,
-        "agent/actor_loss": actor_loss,
-        "agent/entropy": entropy,
-    }
-
-    animation_metrics = {}
-    for i, level_name in enumerate(eval_config.eval_levels):
-        frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
-        frames = np.array(frames[:episode_length])
-        animation_metrics[f"animations/{level_name}"] = wandb.Video(frames, fps=4, format="gif")
+    eval_metrics = build_eval_metrics(stats, eval_config.eval_levels)
+    agent_metrics = build_agent_metrics(stats)
+    animation_metrics = build_animation_metrics(stats, eval_config.eval_levels)
 
     log_dict = {
         **general_metrics,
-        **solve_rate_metrics,
-        **solve_rate_summary_metrics,
-        **return_metrics,
-        **return_summary_metrics,
-        **eval_length_metrics,
+        **eval_metrics,
         **agent_metrics,
         **animation_metrics,
     }
 
     wandb.log(log_dict)
+
+
+def build_runtime_functions(
+    *,
+    env,
+    eval_env,
+    env_params,
+    sample_random_level,
+    env_renderer,
+    runtime_configs: RuntimeConfigs,
+) -> RuntimeFunctions:
+    create_train_state_fn = partial(
+        create_train_state,
+        env=env,
+        env_params=env_params,
+        sample_random_level=sample_random_level,
+        train_loop_shape=runtime_configs.train_loop_shape,
+        optimizer_config=runtime_configs.optimizer_config,
+        network_config=runtime_configs.network_config,
+    )
+    jit_create_train_state = jax.jit(create_train_state_fn)
+
+    eval_policy_fn = partial(
+        eval_policy,
+        eval_env=eval_env,
+        env_params=env_params,
+        eval_levels=runtime_configs.eval_config.eval_levels,
+        network_config=runtime_configs.network_config,
+    )
+
+    train_step_fn = partial(
+        train_step,
+        hparams=runtime_configs.hparams,
+        env=env,
+        env_params=env_params,
+        train_loop_shape=runtime_configs.train_loop_shape,
+    )
+
+    train_and_eval_step_fn = partial(
+        train_and_eval_step,
+        train_step_fn=train_step_fn,
+        eval_policy_fn=eval_policy_fn,
+        env_renderer=env_renderer,
+        env_params=env_params,
+        train_loop_shape=runtime_configs.train_loop_shape,
+        eval_config=runtime_configs.eval_config,
+    )
+    jit_train_and_eval_step = jax.jit(train_and_eval_step_fn)
+
+    return RuntimeFunctions(
+        jit_create_train_state=jit_create_train_state,
+        eval_policy_fn=eval_policy_fn,
+        jit_train_and_eval_step=jit_train_and_eval_step,
+    )
 
 
 def create_train_state(
@@ -855,97 +972,56 @@ def eval_checkpoint(
 
 
 def main(config=None, project="egt-pop"):
-    flat_config = dict(config)
-    flat_config["eval_levels"] = tuple(flat_config["eval_levels"])
+    run_config = dict(config)
+    run_config["eval_levels"] = tuple(run_config["eval_levels"])
+    runtime_configs = parse_runtime_configs(run_config)
 
-    hparams = struct_from_dict(PPOHyperparams, flat_config)
-    train_loop_shape = struct_from_dict(TrainLoopShape, flat_config)
-    optimizer_config = struct_from_dict(OptimizerConfig, flat_config)
-    eval_config = struct_from_dict(EvalConfig, flat_config)
-    checkpoint_config = struct_from_dict(CheckpointConfig, flat_config)
-    network_config = struct_from_dict(NetworkConfig, flat_config)
+    init_wandb(config=run_config, project=project)
 
-    run = init_wandb(config=flat_config, project=project)
-
-    env = Maze(max_height=13, max_width=13, agent_view_size=flat_config["agent_view_size"], normalize_obs=True)
-    eval_env = env
-    sample_random_level = make_level_generator(env.max_height, env.max_width, flat_config["n_walls"])
-    env_renderer = MazeRenderer(env, tile_size=8)
-    env = AutoResetWrapper(env, sample_random_level)
-    env_params = env.default_params
-
-    create_train_state_fn = partial(
-        create_train_state,
+    env, eval_env, sample_random_level, env_renderer, env_params = create_env_components(run_config)
+    runtime_functions = build_runtime_functions(
         env=env,
-        env_params=env_params,
-        sample_random_level=sample_random_level,
-        train_loop_shape=train_loop_shape,
-        optimizer_config=optimizer_config,
-        network_config=network_config,
-    )
-    jit_create_train_state = jax.jit(create_train_state_fn)
-
-    bound_eval_policy = partial(
-        eval_policy,
         eval_env=eval_env,
         env_params=env_params,
-        eval_levels=eval_config.eval_levels,
-        network_config=network_config,
-    )
-
-    bound_train_step = partial(
-        train_step,
-        hparams=hparams,
-        env=env,
-        env_params=env_params,
-        train_loop_shape=train_loop_shape,
-    )
-
-    train_and_eval_step_fn = partial(
-        train_and_eval_step,
-        train_step_fn=bound_train_step,
-        eval_policy_fn=bound_eval_policy,
+        sample_random_level=sample_random_level,
         env_renderer=env_renderer,
-        env_params=env_params,
-        train_loop_shape=train_loop_shape,
-        eval_config=eval_config,
+        runtime_configs=runtime_configs,
     )
-    jit_train_and_eval_step = jax.jit(train_and_eval_step_fn)
 
-    if flat_config['mode'] == 'eval':
+    if run_config['mode'] == 'eval':
         return eval_checkpoint(
-            checkpoint_directory=flat_config['checkpoint_directory'],
-            checkpoint_to_eval=flat_config['checkpoint_to_eval'],
-            eval_config=eval_config,
-            create_train_state_fn=jit_create_train_state,
-            eval_policy_fn=bound_eval_policy,
+            checkpoint_directory=run_config['checkpoint_directory'],
+            checkpoint_to_eval=run_config['checkpoint_to_eval'],
+            eval_config=runtime_configs.eval_config,
+            create_train_state_fn=runtime_functions.jit_create_train_state,
+            eval_policy_fn=runtime_functions.eval_policy_fn,
         )
 
-    rng = jax.random.PRNGKey(flat_config["seed"])
+    rng = jax.random.PRNGKey(run_config["seed"])
     rng_init, rng_train = jax.random.split(rng)
 
-    train_state = jit_create_train_state(rng_init)
+    train_state = runtime_functions.jit_create_train_state(rng_init)
     runner_state = (rng_train, train_state)
 
+    checkpoint_config = runtime_configs.checkpoint_config
     if checkpoint_config.checkpoint_save_interval > 0:
         checkpoint_manager = setup_checkpointing(checkpoint_config)
         save_dir = os.path.join(
             "checkpoints", checkpoint_config.run_name, str(checkpoint_config.seed)
         )
         with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-            json.dump(flat_config, f, indent=2)
+            json.dump(run_config, f, indent=2)
 
+    train_loop_shape = runtime_configs.train_loop_shape
     for eval_step in range(train_loop_shape.n_updates // train_loop_shape.eval_freq):
         start_time = time.time()
-        runner_state, metrics = jit_train_and_eval_step(runner_state, None)
+        runner_state, metrics = runtime_functions.jit_train_and_eval_step(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
         log_eval(
             metrics,
             train_loop_shape=train_loop_shape,
-            eval_config=eval_config,
-            env_renderer=env_renderer,
-            env_params=env_params,
+            eval_config=runtime_configs.eval_config,
         )
         if checkpoint_config.checkpoint_save_interval > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
