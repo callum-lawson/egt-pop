@@ -2,7 +2,7 @@
 
 Compares the three core computational functions:
 - compute_gae: GAE advantage estimation
-- sample_trajectories_rnn: rollout collection
+- rollout_training_trajectories_rnn: rollout collection
 - update_actor_critic_rnn: PPO parameter update
 """
 
@@ -102,8 +102,8 @@ def test_compute_gae():
     assert_allclose(np.array(tgt1), np.array(tgt2), rtol=1e-5)
 
 
-def test_sample_trajectories_rnn(env_and_state):
-    """Trajectory sampling produces identical results with both signatures."""
+def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
+    """Rollout sampling and bootstrap value computation match v1 behavior."""
     env, env_params, train_state = env_and_state
     rng = jax.random.PRNGKey(7)
     n_envs = SMALL_CONFIG["n_train_envs"]
@@ -115,7 +115,7 @@ def test_sample_trajectories_rnn(env_and_state):
         n_envs, n_steps,
     )
 
-    (_, _, _, _, _, last_value_2), traj2 = v2.sample_trajectories_rnn(
+    (_, _, rollout_state), traj2 = v2.rollout_training_trajectories_rnn(
         rng, train_state,
         train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
         env=env, env_params=env_params,
@@ -128,6 +128,7 @@ def test_sample_trajectories_rnn(env_and_state):
             eval_freq=1,
         ),
     )
+    last_value_2 = v2.compute_bootstrap_value(train_state, rollout_state)
 
     assert_allclose(np.array(last_value_1), np.array(last_value_2), rtol=1e-5)
 
