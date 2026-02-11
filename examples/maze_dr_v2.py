@@ -465,12 +465,12 @@ def run_rnn_ppo_epochs(
     n_minibatches = train_loop_shape.n_minibatches
     n_ppo_epochs = train_loop_shape.n_ppo_epochs
 
-    def update_epoch(carry, _):
-        def update_minibatch(train_state, minibatch):
-            loss, grads = compute_rnn_ppo_loss_and_grads(train_state, minibatch, hparams)
-            train_state = train_state.apply_gradients(grads=grads)
-            return train_state, loss
+    def update_minibatch(train_state, minibatch):
+        loss, grads = compute_rnn_ppo_loss_and_grads(train_state, minibatch, hparams)
+        train_state = train_state.apply_gradients(grads=grads)
+        return train_state, loss
 
+    def update_epoch(carry, _):
         rng, train_state = carry
         rng, rng_perm = jax.random.split(rng)
         permutation = jax.random.permutation(rng_perm, n_train_envs)
