@@ -79,6 +79,12 @@ Recent history uses short, imperative commit subjects (for example: `Add ...`, `
 - Name functions by intent and outcome, not internal implementation details.
 - If a name needs "AND" to describe what it does, treat that as a prompt to check whether it should be split.
 
+### Recipe readability (preferred style)
+- Keep orchestration code shallow: avoid deep nesting and long inline setup blocks.
+- At high levels, prefer English component names (`initialize_*`, `build_*`, `run_*`) over abbreviations.
+- Isolate wiring/plumbing in small setup helpers so `main` and train/eval loops read as step-by-step recipes.
+- In orchestration flow, prefer explicit unpacking over tuple indexing when it improves readability.
+
 ## Docstring style
 
 - Use one sentence per function docstring.
