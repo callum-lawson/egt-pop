@@ -266,9 +266,10 @@ def rollout_training_trajectories_rnn(
             log_prob.squeeze(0),
         )
 
+        step_keys = jax.random.split(rng_step, n_train_envs)
         next_obs, env_state, reward, done, info = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(jax.random.split(rng_step, n_train_envs), rollout_state.env_state, action, env_params)
+        )(step_keys, rollout_state.env_state, action, env_params)
 
         next_rollout_state = RolloutState(next_hidden_state, next_obs, env_state, done)
         carry = (rng, train_state, next_rollout_state)
@@ -327,9 +328,10 @@ def rollout_eval_episodes_rnn(
         )
         action = policy_distribution.sample(seed=rng_action).squeeze(0)
 
+        step_keys = jax.random.split(rng_step, n_levels)
         obs, next_state, reward, done, _ = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(jax.random.split(rng_step, n_levels), rollout_state.env_state, action, env_params)
+        )(step_keys, rollout_state.env_state, action, env_params)
 
         next_mask = mask & ~done
         episode_length += mask
@@ -343,9 +345,11 @@ def rollout_eval_episodes_rnn(
         init_env_state,
         jnp.zeros(n_levels, dtype=bool),
     )
+    initial_mask = jnp.ones(n_levels, dtype=bool)
+    initial_episode_length = jnp.zeros(n_levels, dtype=jnp.int32)
     (_, _, _, episode_lengths), (states, rewards) = jax.lax.scan(
         step,
-        (rng, init_rollout_state, jnp.ones(n_levels, dtype=bool), jnp.zeros(n_levels, dtype=jnp.int32)),
+        (rng, init_rollout_state, initial_mask, initial_episode_length),
         None,
         length=max_episode_length,
     )
@@ -648,8 +652,9 @@ def evaluate_policy_attempts(
     n_eval_attempts: int,
 ):
     """Evaluate policy performance across multiple stochastic evaluation attempts."""
+    eval_keys = jax.random.split(rng, n_eval_attempts)
     return jax.vmap(eval_policy_fn, (0, None))(
-        jax.random.split(rng, n_eval_attempts),
+        eval_keys,
         train_state,
     )
 
@@ -778,7 +783,8 @@ def sample_level_batch(
     n_train_envs: int,
 ) -> chex.ArrayTree:
     """Sample a batch of random levels for parallel training environments."""
-    return jax.vmap(sample_random_level)(jax.random.split(rng, n_train_envs))
+    level_keys = jax.random.split(rng, n_train_envs)
+    return jax.vmap(sample_random_level)(level_keys)
 
 
 def reset_envs_to_levels(
@@ -1000,10 +1006,14 @@ def eval_policy(
         levels,
         env_params,
     )
+    initial_eval_hidden_state = ActorCritic.initialize_carry(
+        (n_levels,),
+        network_config.lstm_features,
+    )
     states, rewards, episode_lengths = rollout_eval_episodes_rnn(
         rng,
         train_state,
-        ActorCritic.initialize_carry((n_levels,), network_config.lstm_features),
+        initial_eval_hidden_state,
         init_obs,
         init_env_state,
         env=eval_env,
@@ -1112,7 +1122,8 @@ def run_eval_mode(
     eval_policy_fn,
 ):
     """Run evaluation from a saved checkpoint and persist the resulting metrics."""
-    rng_init, rng_eval = jax.random.split(jax.random.PRNGKey(10000))
+    eval_seed_key = jax.random.PRNGKey(10000)
+    rng_init, rng_eval = jax.random.split(eval_seed_key)
 
     train_state, loaded_config = load_train_state_from_checkpoint(
         rng_init=rng_init,
@@ -1191,7 +1202,8 @@ def run_train_mode(
         )
 
     train_loop_shape = runtime_configs.train_loop_shape
-    for eval_step in range(train_loop_shape.n_updates // train_loop_shape.eval_freq):
+    n_eval_steps = train_loop_shape.n_updates // train_loop_shape.eval_freq
+    for eval_step in range(n_eval_steps):
         runner_state, metrics = run_timed_train_and_eval_step(
             runner_state,
             jit_train_and_eval_step=runtime_functions.jit_train_and_eval_step,

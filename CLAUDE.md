@@ -129,6 +129,7 @@ To add new environments: subclass `UnderspecifiedEnv` and replace the env initia
 - At high levels, prefer English component names (`initialize_*`, `build_*`, `run_*`) over abbreviations.
 - Isolate wiring/plumbing in small setup helpers so `main` and train/eval loops read as step-by-step recipes.
 - In orchestration flow, prefer explicit unpacking over tuple indexing when it improves readability.
+- Prefer naming intermediate values before function calls instead of embedding non-trivial calculations directly in call arguments, when this does not add computational cost.
 
 ## Docstring style
 
