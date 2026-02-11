@@ -22,9 +22,9 @@ from jaxued.utils import max_mc, positive_value_loss
 from jaxued.wrappers import AutoResetWrapper
 import chex
 try:
-    from examples.config_utils import struct_from_dict
+    from examples.config_utils import load_config, struct_from_dict
 except ModuleNotFoundError:
-    from config_utils import struct_from_dict
+    from config_utils import load_config, struct_from_dict
 
 WANDB_STEP_METRIC = "n_updates"
 WANDB_METRIC_PATTERNS = (
@@ -567,9 +567,14 @@ def parse_runtime_configs(flat_config: dict) -> RuntimeConfigs:
 
 
 def normalize_run_config(config: dict) -> dict:
-    """Normalize eval level names to a tuple in a copied run config."""
+    """Normalize raw config values into canonical form for the training pipeline."""
     normalized_config = dict(config)
     normalized_config["eval_levels"] = tuple(normalized_config["eval_levels"])
+    if normalized_config.get("n_env_steps") is not None:
+        normalized_config["n_updates"] = (
+            normalized_config["n_env_steps"]
+            // (normalized_config["n_train_envs"] * normalized_config["n_steps"])
+        )
     return normalized_config
 
 
@@ -1252,7 +1257,8 @@ def main(config=None, project="egt-pop"):
     )
 
 
-if __name__ == "__main__":
+def build_argument_parser():
+    """Build the CLI argument parser for maze DR v2 training and evaluation."""
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -1274,7 +1280,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_number_of_checkpoints", type=int, default=60)
     # === EVAL ===
     parser.add_argument("--eval_freq", type=int, default=250)
-    parser.add_argument("--n_eval_attempts", "--eval_num_attempts", dest="n_eval_attempts", type=int, default=10)
+    parser.add_argument("--n_eval_attempts", type=int, default=10)
     parser.add_argument("--eval_levels", nargs='+', default=[
         "SixteenRooms",
         "SixteenRooms2",
@@ -1290,13 +1296,13 @@ if __name__ == "__main__":
     group.add_argument("--lr", type=float, default=1e-4)
     group.add_argument("--max_grad_norm", type=float, default=0.5)
     mut_group = group.add_mutually_exclusive_group()
-    mut_group.add_argument("--n_updates", "--num_updates", dest="n_updates", type=int, default=30000)
-    mut_group.add_argument("--n_env_steps", "--num_env_steps", dest="n_env_steps", type=int, default=None)
-    group.add_argument("--n_steps", "--num_steps", dest="n_steps", type=int, default=256)
-    group.add_argument("--n_train_envs", "--num_train_envs", dest="n_train_envs", type=int, default=32)
-    group.add_argument("--n_minibatches", "--num_minibatches", dest="n_minibatches", type=int, default=1)
+    mut_group.add_argument("--n_updates", type=int, default=30000)
+    mut_group.add_argument("--n_env_steps", type=int, default=None)
+    group.add_argument("--n_steps", type=int, default=256)
+    group.add_argument("--n_train_envs", type=int, default=32)
+    group.add_argument("--n_minibatches", type=int, default=1)
     group.add_argument("--gamma", type=float, default=0.995)
-    group.add_argument("--n_ppo_epochs", "--epoch_ppo", dest="n_ppo_epochs", type=int, default=5)
+    group.add_argument("--n_ppo_epochs", type=int, default=5)
     group.add_argument("--clip_eps", type=float, default=0.2)
     group.add_argument("--gae_lambda", type=float, default=0.98)
     group.add_argument("--entropy_coeff", type=float, default=1e-3)
@@ -1305,31 +1311,11 @@ if __name__ == "__main__":
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
+    return parser
 
-    try:
-        from examples.config_utils import load_config
-    except ModuleNotFoundError:
-        from config_utils import load_config
+
+if __name__ == "__main__":
+    parser = build_argument_parser()
     config = load_config(parser)
-
-    # Backward compatibility for YAML files that still use legacy v1 keys.
-    legacy_to_new = {
-        "eval_num_attempts": "n_eval_attempts",
-        "num_updates": "n_updates",
-        "num_env_steps": "n_env_steps",
-        "num_steps": "n_steps",
-        "num_train_envs": "n_train_envs",
-        "num_minibatches": "n_minibatches",
-        "epoch_ppo": "n_ppo_epochs",
-    }
-    for legacy_key, new_key in legacy_to_new.items():
-        if legacy_key in config and config.get(new_key) == parser.get_default(new_key):
-            config[new_key] = config[legacy_key]
-
-    if config["n_env_steps"] is not None:
-        config["n_updates"] = config["n_env_steps"] // (config["n_train_envs"] * config["n_steps"])
-
-    if config['mode'] == 'eval':
-        os.environ['WANDB_MODE'] = 'disabled'
-
+    config = normalize_run_config(config)
     main(config, project=config["project"])
