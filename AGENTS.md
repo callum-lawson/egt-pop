@@ -69,6 +69,24 @@ Recent history uses short, imperative commit subjects (for example: `Add ...`, `
 ### When naming is hard
 - Treat it as a design smell: split responsibilities, extract a sharper function/class, name the general concept plainly and specialize the variants.
 
+## Function design philosophy
+
+- Prefer code that reads like a clear recipe at the right level of abstraction.
+- Use function boundaries to express meaning, not just mechanics.
+- Split functions when they perform distinct, friend-level actions.
+- Keep orchestration/composition functions when they represent one coherent workflow step.
+- Avoid splitting purely for ideological SRP if it harms readability or flow.
+- Name functions by intent and outcome, not internal implementation details.
+- If a name needs "AND" to describe what it does, treat that as a prompt to check whether it should be split.
+
+## Docstring style
+
+- Use one sentence per function docstring.
+- Describe what the function does in plain language.
+- Use `AND` only when the function truly performs multiple distinct actions.
+- Do not use `AND` for incidental plumbing or internal setup details.
+- Prefer recipe-style phrasing for orchestration functions.
+
 ### Comments
 - Default: no inline comments.
 - Refactor for readability instead (names, constants, small functions, types).
