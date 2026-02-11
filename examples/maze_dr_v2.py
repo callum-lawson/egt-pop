@@ -1,7 +1,6 @@
 import os
 import json
 import time
-from functools import partial
 from typing import Callable, NamedTuple, Sequence, Tuple
 
 import numpy as np
@@ -214,7 +213,7 @@ class ActorCritic(nn.Module):
 def compute_gae(
     hparams: PPOHyperparams,
     last_value: chex.Array,
-    traj: Trajectory,
+    trajectory: Trajectory,
 ) -> Tuple[chex.Array, chex.Array]:
     """Compute GAE advantages and value targets from a trajectory."""
     def compute_gae_at_timestep(carry, timestep_data):
@@ -227,17 +226,17 @@ def compute_gae(
     _, advantages = jax.lax.scan(
         compute_gae_at_timestep,
         (jnp.zeros_like(last_value), last_value),
-        (traj.value, traj.reward, traj.done),
+        (trajectory.value, trajectory.reward, trajectory.done),
         reverse=True,
         unroll=16,
     )
-    return advantages, advantages + traj.value
+    return advantages, advantages + trajectory.value
 
 
 def rollout_training_trajectories_rnn(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hstate: chex.ArrayTree,
+    init_hidden_state: chex.ArrayTree,
     init_obs: Observation,
     init_env_state: EnvState,
     *,
@@ -276,19 +275,19 @@ def rollout_training_trajectories_rnn(
         return carry, Trajectory(rollout_state.obs, action, reward, done, log_prob, value, info)
 
     init_rollout_state = RolloutState(
-        init_hstate,
+        init_hidden_state,
         init_obs,
         init_env_state,
         jnp.zeros(n_train_envs, dtype=bool),
     )
-    (rng, train_state, rollout_state), traj = jax.lax.scan(
+    (rng, train_state, rollout_state), trajectory = jax.lax.scan(
         sample_step,
         (rng, train_state, init_rollout_state),
         None,
         length=n_steps,
     )
 
-    return (rng, train_state, rollout_state), traj
+    return (rng, train_state, rollout_state), trajectory
 
 
 def compute_bootstrap_value(
@@ -304,7 +303,7 @@ def compute_bootstrap_value(
 def rollout_eval_episodes_rnn(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hstate: chex.ArrayTree,
+    init_hidden_state: chex.ArrayTree,
     init_obs: Observation,
     init_env_state: EnvState,
     *,
@@ -339,7 +338,7 @@ def rollout_eval_episodes_rnn(
         return (rng, next_rollout_state, next_mask, episode_length), (rollout_state.env_state, reward)
 
     init_rollout_state = RolloutState(
-        init_hstate,
+        init_hidden_state,
         init_obs,
         init_env_state,
         jnp.zeros(n_levels, dtype=bool),
@@ -366,36 +365,36 @@ def compute_episode_returns(
 
 
 def build_ppo_update_batch(
-    traj: Trajectory,
+    trajectory: Trajectory,
     targets: chex.Array,
     advantages: chex.Array,
 ) -> PPOUpdateBatch:
     """Build a PPO update batch from rollout trajectories and computed targets."""
     return PPOUpdateBatch(
-        obs=traj.obs,
-        action=traj.action,
-        done=traj.done,
-        log_prob=traj.log_prob,
-        value=traj.value,
+        obs=trajectory.obs,
+        action=trajectory.action,
+        done=trajectory.done,
+        log_prob=trajectory.log_prob,
+        value=trajectory.value,
         targets=targets,
         advantages=advantages,
     )
 
 
 def build_rnn_minibatches(
-    init_hstate: chex.ArrayTree,
+    init_hidden_state: chex.ArrayTree,
     batch: PPOUpdateBatch,
     permutation: chex.Array,
     n_minibatches: int,
 ) -> Tuple[chex.ArrayTree, ...]:
     """Build shuffled rollout minibatches for recurrent PPO updates."""
-    minibatched_init_hstate = jax.tree.map(
+    minibatched_init_hidden_state = jax.tree.map(
         lambda x: jnp.take(x, permutation, axis=0).reshape(
             n_minibatches,
             -1,
             *x.shape[1:],
         ),
-        init_hstate,
+        init_hidden_state,
     )
 
     minibatched_batch = jax.tree.map(
@@ -405,7 +404,7 @@ def build_rnn_minibatches(
         batch,
     )
 
-    return (minibatched_init_hstate, *minibatched_batch)
+    return (minibatched_init_hidden_state, *minibatched_batch)
 
 
 def prepare_rnn_ppo_batch(batch: PPOUpdateBatch) -> PPOUpdateBatch:
@@ -420,13 +419,17 @@ def compute_rnn_ppo_loss_and_grads(
     hparams: PPOHyperparams,
 ):
     """Compute PPO minibatch losses and gradients for the current training state."""
-    init_hstate, obs, action, done, log_prob, value, targets, advantages = minibatch
+    init_hidden_state, obs, action, done, log_prob, value, targets, advantages = minibatch
     clip_eps = hparams.clip_eps
     entropy_coeff = hparams.entropy_coeff
     critic_coeff = hparams.critic_coeff
 
     def loss_fn(params):
-        _, policy_distribution, value_pred = train_state.apply_fn(params, (obs, done), init_hstate)
+        _, policy_distribution, value_pred = train_state.apply_fn(
+            params,
+            (obs, done),
+            init_hidden_state,
+        )
         log_prob_pred = policy_distribution.log_prob(action)
         entropy = policy_distribution.entropy().mean()
 
@@ -454,7 +457,7 @@ def compute_rnn_ppo_loss_and_grads(
 def run_rnn_ppo_epochs(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hstate: chex.ArrayTree,
+    init_hidden_state: chex.ArrayTree,
     batch: PPOUpdateBatch,
     hparams: PPOHyperparams,
     *,
@@ -476,7 +479,7 @@ def run_rnn_ppo_epochs(
         permutation = jax.random.permutation(rng_perm, n_train_envs)
 
         minibatches = build_rnn_minibatches(
-            init_hstate,
+            init_hidden_state,
             batch,
             permutation,
             n_minibatches,
@@ -490,7 +493,7 @@ def run_rnn_ppo_epochs(
 def update_actor_critic_rnn(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hstate: chex.ArrayTree,
+    init_hidden_state: chex.ArrayTree,
     batch: PPOUpdateBatch,
     hparams: PPOHyperparams,
     *,
@@ -501,7 +504,7 @@ def update_actor_critic_rnn(
     return run_rnn_ppo_epochs(
         rng,
         train_state,
-        init_hstate,
+        init_hidden_state,
         prepared_batch,
         hparams,
         train_loop_shape=train_loop_shape,
@@ -695,42 +698,51 @@ def build_runtime_functions(
     runtime_configs: RuntimeConfigs,
 ) -> RuntimeFunctions:
     """Build runtime callables from environment and run configs."""
-    create_train_state_fn = partial(
-        create_train_state,
-        env=env_components.env,
-        env_params=env_components.env_params,
-        sample_random_level=env_components.sample_random_level,
-        train_loop_shape=runtime_configs.train_loop_shape,
-        optimizer_config=runtime_configs.optimizer_config,
-        network_config=runtime_configs.network_config,
-    )
+    def create_train_state_fn(rng):
+        return create_train_state(
+            rng,
+            env=env_components.env,
+            env_params=env_components.env_params,
+            sample_random_level=env_components.sample_random_level,
+            train_loop_shape=runtime_configs.train_loop_shape,
+            optimizer_config=runtime_configs.optimizer_config,
+            network_config=runtime_configs.network_config,
+        )
+
     jit_create_train_state = jax.jit(create_train_state_fn)
 
-    eval_policy_fn = partial(
-        eval_policy,
-        eval_env=env_components.eval_env,
-        env_params=env_components.env_params,
-        eval_levels=runtime_configs.eval_config.eval_levels,
-        network_config=runtime_configs.network_config,
-    )
+    def eval_policy_fn(rng, train_state):
+        return eval_policy(
+            rng,
+            train_state,
+            eval_env=env_components.eval_env,
+            env_params=env_components.env_params,
+            eval_levels=runtime_configs.eval_config.eval_levels,
+            network_config=runtime_configs.network_config,
+        )
 
-    train_step_fn = partial(
-        train_step,
-        hparams=runtime_configs.hparams,
-        env=env_components.env,
-        env_params=env_components.env_params,
-        train_loop_shape=runtime_configs.train_loop_shape,
-    )
+    def train_step_fn(carry, scan_item):
+        return train_step(
+            carry,
+            scan_item,
+            hparams=runtime_configs.hparams,
+            env=env_components.env,
+            env_params=env_components.env_params,
+            train_loop_shape=runtime_configs.train_loop_shape,
+        )
 
-    train_and_eval_step_fn = partial(
-        train_and_eval_step,
-        train_step_fn=train_step_fn,
-        eval_policy_fn=eval_policy_fn,
-        env_renderer=env_components.env_renderer,
-        env_params=env_components.env_params,
-        train_loop_shape=runtime_configs.train_loop_shape,
-        eval_config=runtime_configs.eval_config,
-    )
+    def train_and_eval_step_fn(runner_state, scan_item):
+        return train_and_eval_step(
+            runner_state,
+            scan_item,
+            train_step_fn=train_step_fn,
+            eval_policy_fn=eval_policy_fn,
+            env_renderer=env_components.env_renderer,
+            env_params=env_components.env_params,
+            train_loop_shape=runtime_configs.train_loop_shape,
+            eval_config=runtime_configs.eval_config,
+        )
+
     jit_train_and_eval_step = jax.jit(train_and_eval_step_fn)
 
     return RuntimeFunctions(
@@ -797,19 +809,91 @@ def create_train_state(
     network_config: NetworkConfig,
 ) -> TrainState:
     """Create a fresh TrainState from initialized network, optimizer, and environment carry."""
-    def learning_rate_schedule(update_step_count):
-        frac = (
-            1.0
-            - (
-                update_step_count
-                // (train_loop_shape.n_minibatches * train_loop_shape.n_ppo_epochs)
-            )
-            / train_loop_shape.n_updates
-        )
-        return optimizer_config.lr * frac
-
     n_train_envs = train_loop_shape.n_train_envs
-    obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
+    initial_hidden_state = ActorCritic.initialize_carry(
+        (n_train_envs,),
+        network_config.lstm_features,
+    )
+
+    rng, rng_network_init = jax.random.split(rng)
+    network, network_params = initialize_actor_critic_network(
+        rng_network_init,
+        env=env,
+        env_params=env_params,
+        sample_random_level=sample_random_level,
+        n_train_envs=n_train_envs,
+        network_config=network_config,
+        initial_hidden_state=initial_hidden_state,
+    )
+    optimizer = build_optimizer(
+        optimizer_config=optimizer_config,
+        train_loop_shape=train_loop_shape,
+    )
+    rng, rng_levels, rng_reset = jax.random.split(rng, 3)
+    init_obs, init_env_state = initialize_training_carry_state(
+        rng_levels=rng_levels,
+        rng_reset=rng_reset,
+        sample_random_level=sample_random_level,
+        n_train_envs=n_train_envs,
+        env=env,
+        env_params=env_params,
+    )
+
+    return TrainState.create(
+        apply_fn=network.apply,
+        params=network_params,
+        tx=optimizer,
+        update_count=0,
+        last_hstate=initial_hidden_state,
+        last_obs=init_obs,
+        last_env_state=init_env_state,
+    )
+
+
+def create_learning_rate_schedule(
+    *,
+    optimizer_config: OptimizerConfig,
+    train_loop_shape: TrainLoopShape,
+):
+    """Create the linear learning-rate schedule used by PPO updates."""
+    ppo_updates_per_step = train_loop_shape.n_minibatches * train_loop_shape.n_ppo_epochs
+
+    def learning_rate_schedule(update_step_count):
+        completed_update_steps = update_step_count // ppo_updates_per_step
+        remaining_fraction = 1.0 - completed_update_steps / train_loop_shape.n_updates
+        return optimizer_config.lr * remaining_fraction
+
+    return learning_rate_schedule
+
+
+def build_optimizer(
+    *,
+    optimizer_config: OptimizerConfig,
+    train_loop_shape: TrainLoopShape,
+):
+    """Build the optimizer stack for actor-critic parameter updates."""
+    learning_rate_schedule = create_learning_rate_schedule(
+        optimizer_config=optimizer_config,
+        train_loop_shape=train_loop_shape,
+    )
+    return optax.chain(
+        optax.clip_by_global_norm(optimizer_config.max_grad_norm),
+        optax.adam(learning_rate=learning_rate_schedule, eps=1e-5),
+    )
+
+
+def initialize_actor_critic_network(
+    rng_network_init: chex.PRNGKey,
+    *,
+    env: UnderspecifiedEnv,
+    env_params: EnvParams,
+    sample_random_level,
+    n_train_envs: int,
+    network_config: NetworkConfig,
+    initial_hidden_state: chex.ArrayTree,
+):
+    """Initialize the actor-critic network and return the module with initialized parameters."""
+    obs, _ = env.reset_to_level(rng_network_init, sample_random_level(rng_network_init), env_params)
     init_sequence_length = network_config.lstm_features
     sequence_batched_obs, init_done = build_network_init_inputs(
         obs,
@@ -818,44 +902,34 @@ def create_train_state(
     )
     network_init_inputs = (sequence_batched_obs, init_done)
     network = ActorCritic(env.action_space(env_params).n, network_config=network_config)
-    rng, rng_network_init = jax.random.split(rng)
     network_params = network.init(
         rng_network_init,
         network_init_inputs,
-        ActorCritic.initialize_carry(
-            (n_train_envs,),
-            network_config.lstm_features,
-        ),
+        initial_hidden_state,
     )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(optimizer_config.max_grad_norm),
-        optax.adam(learning_rate=learning_rate_schedule, eps=1e-5),
-    )
+    return network, network_params
 
-    rng_levels, rng_reset = jax.random.split(rng)
+
+def initialize_training_carry_state(
+    *,
+    rng_levels: chex.PRNGKey,
+    rng_reset: chex.PRNGKey,
+    sample_random_level,
+    n_train_envs: int,
+    env: UnderspecifiedEnv,
+    env_params: EnvParams,
+) -> Tuple[Observation, EnvState]:
+    """Initialize the per-environment observation and state carry for training rollouts."""
     levels = sample_level_batch(
         rng_levels,
         sample_random_level=sample_random_level,
         n_train_envs=n_train_envs,
     )
-    init_obs, init_env_state = reset_envs_to_levels(
+    return reset_envs_to_levels(
         rng_reset,
         env=env,
         env_params=env_params,
         levels=levels,
-    )
-
-    return TrainState.create(
-        apply_fn=network.apply,
-        params=network_params,
-        tx=optimizer,
-        update_count=0,
-        last_hstate=ActorCritic.initialize_carry(
-            (n_train_envs,),
-            network_config.lstm_features,
-        ),
-        last_obs=init_obs,
-        last_env_state=init_env_state,
     )
 
 
@@ -871,7 +945,7 @@ def train_step(
     """Run one PPO training recipe from rollout collection through actor-critic update."""
     rng, train_state = carry
 
-    (rng, train_state, rollout_state), traj = rollout_training_trajectories_rnn(
+    (rng, train_state, rollout_state), trajectory = rollout_training_trajectories_rnn(
         rng,
         train_state,
         train_state.last_hstate,
@@ -882,8 +956,8 @@ def train_step(
         train_loop_shape=train_loop_shape,
     )
     last_value = compute_bootstrap_value(train_state, rollout_state)
-    advantages, targets = compute_gae(hparams, last_value, traj)
-    ppo_update_batch = build_ppo_update_batch(traj, targets, advantages)
+    advantages, targets = compute_gae(hparams, last_value, trajectory)
+    ppo_update_batch = build_ppo_update_batch(trajectory, targets, advantages)
 
     (rng, train_state), losses = update_actor_critic_rnn(
         rng,
@@ -1097,8 +1171,11 @@ def run_train_mode(
     run_config: dict,
     runtime_configs: RuntimeConfigs,
     runtime_functions: RuntimeFunctions,
+    project: str,
 ):
     """Run training with periodic evaluation, logging, and optional checkpoint persistence."""
+    init_wandb(config=run_config, project=project)
+
     rng = jax.random.PRNGKey(run_config["seed"])
     rng_init, rng_train = jax.random.split(rng)
 
@@ -1119,6 +1196,7 @@ def run_train_mode(
             runner_state,
             jit_train_and_eval_step=runtime_functions.jit_train_and_eval_step,
         )
+        _, train_state = runner_state
         log_eval(
             metrics,
             train_loop_shape=train_loop_shape,
@@ -1128,18 +1206,16 @@ def run_train_mode(
             save_checkpoint(
                 checkpoint_manager,
                 eval_step=eval_step,
-                train_state=runner_state[1],
+                train_state=train_state,
             )
 
-    return runner_state[1]
+    return train_state
 
 
 def main(config=None, project="egt-pop"):
     """Run train or eval mode from the provided config and project settings."""
     run_config = normalize_run_config(config)
     runtime_configs = parse_runtime_configs(run_config)
-
-    init_wandb(config=run_config, project=project)
 
     env_components = create_env_components(run_config)
     runtime_functions = build_runtime_functions(
@@ -1160,6 +1236,7 @@ def main(config=None, project="egt-pop"):
         run_config=run_config,
         runtime_configs=runtime_configs,
         runtime_functions=runtime_functions,
+        project=project,
     )
 
 
