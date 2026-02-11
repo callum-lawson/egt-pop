@@ -110,7 +110,6 @@ class RolloutState(NamedTuple):
     env_state: EnvState
     done: chex.Array
 
-
 class RuntimeConfigs(NamedTuple):
     hparams: PPOHyperparams
     train_loop_shape: TrainLoopShape
@@ -253,8 +252,7 @@ def sample_trajectories_rnn(
     *,
     env: UnderspecifiedEnv,
     env_params: EnvParams,
-    n_envs: int,
-    max_episode_length: int,
+    train_loop_shape: TrainLoopShape,
 ) -> Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Trajectory]:
     """Sample trajectories using the agent in train_state.
 
@@ -266,18 +264,20 @@ def sample_trajectories_rnn(
         init_env_state: Initial env state, shape (NUM_ENVS, ...)
         env: Environment instance
         env_params: Environment parameters
-        n_envs: Number of parallel environments
-        max_episode_length: Rollout length
+        train_loop_shape: Training loop dimensions
 
     Returns:
         ((rng, train_state, hstate, last_obs, last_env_state, last_value), traj)
     """
+    n_train_envs = train_loop_shape.n_train_envs
+    n_steps = train_loop_shape.n_steps
+
     def sample_step(carry, _):
         rng, train_state, rollout_state = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        x = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
-        hstate, pi, value = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
+        policy_inputs = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+        hstate, pi, value = train_state.apply_fn(train_state.params, policy_inputs, rollout_state.hstate)
         action = pi.sample(seed=rng_action)
         log_prob = pi.log_prob(action)
         value, action, log_prob = (
@@ -288,7 +288,7 @@ def sample_trajectories_rnn(
 
         next_obs, env_state, reward, done, info = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(jax.random.split(rng_step, n_envs), rollout_state.env_state, action, env_params)
+        )(jax.random.split(rng_step, n_train_envs), rollout_state.env_state, action, env_params)
 
         next_rollout_state = RolloutState(hstate, next_obs, env_state, done)
         carry = (rng, train_state, next_rollout_state)
@@ -298,17 +298,17 @@ def sample_trajectories_rnn(
         init_hstate,
         init_obs,
         init_env_state,
-        jnp.zeros(n_envs, dtype=bool),
+        jnp.zeros(n_train_envs, dtype=bool),
     )
     (rng, train_state, rollout_state), traj = jax.lax.scan(
         sample_step,
         (rng, train_state, init_rollout_state),
         None,
-        length=max_episode_length,
+        length=n_steps,
     )
 
-    x = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
-    _, _, last_value = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
+    policy_inputs = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+    _, _, last_value = train_state.apply_fn(train_state.params, policy_inputs, rollout_state.hstate)
 
     return (
         rng,
@@ -354,8 +354,8 @@ def evaluate_rnn(
         rng, rollout_state, mask, episode_length = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        x = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
-        hstate, pi, _ = train_state.apply_fn(train_state.params, x, rollout_state.hstate)
+        policy_inputs = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
+        hstate, pi, _ = train_state.apply_fn(train_state.params, policy_inputs, rollout_state.hstate)
         action = pi.sample(seed=rng_action).squeeze(0)
 
         obs, next_state, reward, done, _ = jax.vmap(
@@ -384,6 +384,41 @@ def evaluate_rnn(
     return states, rewards, episode_lengths
 
 
+def compute_episode_returns(
+    rewards: chex.Array,
+    episode_lengths: chex.Array,
+    *,
+    max_episode_length: int,
+) -> chex.Array:
+    valid_step_mask = jnp.arange(max_episode_length)[..., None] < episode_lengths
+    return (rewards * valid_step_mask).sum(axis=0)
+
+
+def build_rnn_minibatches(
+    init_hstate: chex.ArrayTree,
+    batch: PPOUpdateBatch,
+    permutation: chex.Array,
+    n_minibatches: int,
+) -> Tuple[chex.ArrayTree, ...]:
+    minibatched_init_hstate = jax.tree.map(
+        lambda x: jnp.take(x, permutation, axis=0).reshape(
+            n_minibatches,
+            -1,
+            *x.shape[1:],
+        ),
+        init_hstate,
+    )
+
+    minibatched_batch = jax.tree.map(
+        lambda x: jnp.take(x, permutation, axis=1)
+        .reshape(x.shape[0], n_minibatches, -1, *x.shape[2:])
+        .swapaxes(0, 1),
+        batch,
+    )
+
+    return (minibatched_init_hstate, *minibatched_batch)
+
+
 def update_actor_critic_rnn(
     rng: chex.PRNGKey,
     train_state: TrainState,
@@ -391,10 +426,7 @@ def update_actor_critic_rnn(
     batch: PPOUpdateBatch,
     hparams: PPOHyperparams,
     *,
-    n_envs: int,
-    n_steps: int,
-    n_minibatches: int,
-    n_ppo_epochs: int,
+    train_loop_shape: TrainLoopShape,
     update_grad: bool = True,
 ) -> Tuple[Tuple[chex.PRNGKey, TrainState], chex.ArrayTree]:
     """Update the actor-critic using PPO on a batch of rollout data.
@@ -405,10 +437,7 @@ def update_actor_critic_rnn(
         init_hstate: Initial RNN hidden state
         batch: PPO update batch
         hparams: PPO hyperparameters (clip_eps, entropy_coeff, critic_coeff)
-        n_envs: Number of environments
-        n_steps: Number of rollout steps
-        n_minibatches: Number of minibatches
-        n_ppo_epochs: Number of PPO epochs
+        train_loop_shape: Training loop dimensions
         update_grad: If False, skip applying gradients
 
     Returns:
@@ -420,6 +449,9 @@ def update_actor_critic_rnn(
     clip_eps = hparams.clip_eps
     entropy_coeff = hparams.entropy_coeff
     critic_coeff = hparams.critic_coeff
+    n_train_envs = train_loop_shape.n_train_envs
+    n_minibatches = train_loop_shape.n_minibatches
+    n_ppo_epochs = train_loop_shape.n_ppo_epochs
 
     def update_epoch(carry, _):
         def update_minibatch(train_state, minibatch):
@@ -452,33 +484,13 @@ def update_actor_critic_rnn(
 
         rng, train_state = carry
         rng, rng_perm = jax.random.split(rng)
-        permutation = jax.random.permutation(rng_perm, n_envs)
+        permutation = jax.random.permutation(rng_perm, n_train_envs)
 
-        shuffled_init_hstate = jax.tree.map(
-            lambda x: jnp.take(x, permutation, axis=0),
+        minibatches = build_rnn_minibatches(
             init_hstate,
-        )
-        minibatched_init_hstate = jax.tree.map(
-            lambda x: x.reshape(n_minibatches, -1, *x.shape[1:]),
-            shuffled_init_hstate,
-        )
-
-        shuffled_batch = jax.tree.map(
-            lambda x: jnp.take(x, permutation, axis=1),
             batch,
-        )
-        reshaped_batch = jax.tree.map(
-            lambda x: x.reshape(x.shape[0], n_minibatches, -1, *x.shape[2:]),
-            shuffled_batch,
-        )
-        minibatched_batch = jax.tree.map(
-            lambda x: x.swapaxes(0, 1),
-            reshaped_batch,
-        )
-
-        minibatches = (
-            minibatched_init_hstate,
-            *minibatched_batch,
+            permutation,
+            n_minibatches,
         )
         train_state, losses = jax.lax.scan(update_minibatch, train_state, minibatches)
         return (rng, train_state), losses
@@ -540,6 +552,12 @@ def parse_runtime_configs(flat_config: dict) -> RuntimeConfigs:
         checkpoint_config=struct_from_dict(CheckpointConfig, flat_config),
         network_config=struct_from_dict(NetworkConfig, flat_config),
     )
+
+
+def normalize_run_config(config: dict) -> dict:
+    normalized_config = dict(config)
+    normalized_config["eval_levels"] = tuple(normalized_config["eval_levels"])
+    return normalized_config
 
 
 def create_env_components(flat_config: dict) -> EnvComponents:
@@ -686,6 +704,42 @@ def build_runtime_functions(
     )
 
 
+def build_network_init_inputs(
+    obs: Observation,
+    *,
+    n_train_envs: int,
+    init_sequence_length: int,
+) -> Tuple[Observation, chex.Array]:
+    env_batched_obs = jax.tree.map(
+        lambda tensor: jnp.repeat(tensor[None, ...], n_train_envs, axis=0),
+        obs,
+    )
+    sequence_batched_obs = jax.tree.map(
+        lambda tensor: jnp.repeat(tensor[None, ...], init_sequence_length, axis=0),
+        env_batched_obs,
+    )
+    init_done = jnp.zeros((init_sequence_length, n_train_envs))
+    return sequence_batched_obs, init_done
+
+
+def reset_env_batch(
+    rng: chex.PRNGKey,
+    *,
+    env: UnderspecifiedEnv,
+    env_params: EnvParams,
+    sample_random_level,
+    n_train_envs: int,
+) -> Tuple[Observation, EnvState]:
+    rng_levels, rng_reset = jax.random.split(rng)
+    levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, n_train_envs))
+    reset_keys = jax.random.split(rng_reset, n_train_envs)
+    return jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
+        reset_keys,
+        levels,
+        env_params,
+    )
+
+
 def create_train_state(
     rng: chex.PRNGKey,
     *,
@@ -718,24 +772,22 @@ def create_train_state(
         )
         return optimizer_config.lr * frac
 
+    n_train_envs = train_loop_shape.n_train_envs
     obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
     init_sequence_length = network_config.lstm_features
-    obs_for_env_batch = jax.tree.map(
-        lambda t: jnp.repeat(t[None, ...], train_loop_shape.n_train_envs, axis=0),
+    sequence_batched_obs, init_done = build_network_init_inputs(
         obs,
+        n_train_envs=n_train_envs,
+        init_sequence_length=init_sequence_length,
     )
-    obs = jax.tree.map(
-        lambda t: jnp.repeat(t[None, ...], init_sequence_length, axis=0),
-        obs_for_env_batch,
-    )
-    init_x = (obs, jnp.zeros((init_sequence_length, train_loop_shape.n_train_envs)))
+    init_x = (sequence_batched_obs, init_done)
     network = ActorCritic(env.action_space(env_params).n, network_config=network_config)
     rng, _rng = jax.random.split(rng)
     network_params = network.init(
         _rng,
         init_x,
         ActorCritic.initialize_carry(
-            (train_loop_shape.n_train_envs,),
+            (n_train_envs,),
             network_config.lstm_features,
         ),
     )
@@ -744,13 +796,12 @@ def create_train_state(
         optax.adam(learning_rate=linear_schedule, eps=1e-5),
     )
 
-    rng_levels, rng_reset = jax.random.split(rng)
-    new_levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, train_loop_shape.n_train_envs))
-    reset_keys = jax.random.split(rng_reset, train_loop_shape.n_train_envs)
-    init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
-        reset_keys,
-        new_levels,
-        env_params,
+    init_obs, init_env_state = reset_env_batch(
+        rng,
+        env=env,
+        env_params=env_params,
+        sample_random_level=sample_random_level,
+        n_train_envs=n_train_envs,
     )
 
     return TrainState.create(
@@ -759,7 +810,7 @@ def create_train_state(
         tx=tx,
         update_count=0,
         last_hstate=ActorCritic.initialize_carry(
-            (train_loop_shape.n_train_envs,),
+            (n_train_envs,),
             network_config.lstm_features,
         ),
         last_obs=init_obs,
@@ -799,8 +850,7 @@ def train_step(
         train_state.last_env_state,
         env=env,
         env_params=env_params,
-        n_envs=train_loop_shape.n_train_envs,
-        max_episode_length=train_loop_shape.n_steps,
+        train_loop_shape=train_loop_shape,
     )
     advantages, targets = compute_gae(hparams, last_value, traj)
 
@@ -818,10 +868,7 @@ def train_step(
             advantages=advantages,
         ),
         hparams,
-        n_envs=train_loop_shape.n_train_envs,
-        n_steps=train_loop_shape.n_steps,
-        n_minibatches=train_loop_shape.n_minibatches,
-        n_ppo_epochs=train_loop_shape.n_ppo_epochs,
+        train_loop_shape=train_loop_shape,
         update_grad=True,
     )
 
@@ -879,8 +926,11 @@ def eval_policy(
         env_params=env_params,
         max_episode_length=env_params.max_steps_in_episode,
     )
-    mask = jnp.arange(env_params.max_steps_in_episode)[..., None] < episode_lengths
-    cum_rewards = (rewards * mask).sum(axis=0)
+    cum_rewards = compute_episode_returns(
+        rewards,
+        episode_lengths,
+        max_episode_length=env_params.max_steps_in_episode,
+    )
     return states, cum_rewards, episode_lengths
 
 
@@ -925,16 +975,19 @@ def train_and_eval_step(
     images = jax.vmap(jax.vmap(env_renderer.render_state, (0, None)), (0, None))(states, env_params)
     frames = images.transpose(0, 1, 4, 2, 3)
 
-    metrics["update_count"] = train_state.update_count
-    metrics["eval_returns"] = eval_returns
-    metrics["eval_solve_rates"] = eval_solve_rates
-    metrics["eval_ep_lengths"] = episode_lengths
-    metrics["eval_animation"] = (frames, episode_lengths)
+    eval_metrics = {
+        "update_count": train_state.update_count,
+        "eval_returns": eval_returns,
+        "eval_solve_rates": eval_solve_rates,
+        "eval_ep_lengths": episode_lengths,
+        "eval_animation": (frames, episode_lengths),
+    }
+    combined_metrics = {**metrics, **eval_metrics}
 
-    return (rng, train_state), metrics
+    return (rng, train_state), combined_metrics
 
 
-def eval_checkpoint(
+def run_eval_mode(
     *,
     checkpoint_directory: str,
     checkpoint_to_eval: int,
@@ -984,28 +1037,12 @@ def eval_checkpoint(
     return states, cum_rewards, episode_lengths
 
 
-def main(config=None, project="egt-pop"):
-    run_config = dict(config)
-    run_config["eval_levels"] = tuple(run_config["eval_levels"])
-    runtime_configs = parse_runtime_configs(run_config)
-
-    init_wandb(config=run_config, project=project)
-
-    env_components = create_env_components(run_config)
-    runtime_functions = build_runtime_functions(
-        env_components=env_components,
-        runtime_configs=runtime_configs,
-    )
-
-    if run_config['mode'] == 'eval':
-        return eval_checkpoint(
-            checkpoint_directory=run_config['checkpoint_directory'],
-            checkpoint_to_eval=run_config['checkpoint_to_eval'],
-            eval_config=runtime_configs.eval_config,
-            create_train_state_fn=runtime_functions.jit_create_train_state,
-            eval_policy_fn=runtime_functions.eval_policy_fn,
-        )
-
+def run_train_mode(
+    *,
+    run_config: dict,
+    runtime_configs: RuntimeConfigs,
+    runtime_functions: RuntimeFunctions,
+):
     rng = jax.random.PRNGKey(run_config["seed"])
     rng_init, rng_train = jax.random.split(rng)
 
@@ -1037,6 +1074,34 @@ def main(config=None, project="egt-pop"):
             checkpoint_manager.wait_until_finished()
 
     return runner_state[1]
+
+
+def main(config=None, project="egt-pop"):
+    run_config = normalize_run_config(config)
+    runtime_configs = parse_runtime_configs(run_config)
+
+    init_wandb(config=run_config, project=project)
+
+    env_components = create_env_components(run_config)
+    runtime_functions = build_runtime_functions(
+        env_components=env_components,
+        runtime_configs=runtime_configs,
+    )
+
+    if run_config['mode'] == 'eval':
+        return run_eval_mode(
+            checkpoint_directory=run_config['checkpoint_directory'],
+            checkpoint_to_eval=run_config['checkpoint_to_eval'],
+            eval_config=runtime_configs.eval_config,
+            create_train_state_fn=runtime_functions.jit_create_train_state,
+            eval_policy_fn=runtime_functions.eval_policy_fn,
+        )
+
+    return run_train_mode(
+        run_config=run_config,
+        runtime_configs=runtime_configs,
+        runtime_functions=runtime_functions,
+    )
 
 
 if __name__ == "__main__":

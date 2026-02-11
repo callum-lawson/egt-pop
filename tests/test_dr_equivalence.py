@@ -119,7 +119,14 @@ def test_sample_trajectories_rnn(env_and_state):
         rng, train_state,
         train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
         env=env, env_params=env_params,
-        n_envs=n_envs, max_episode_length=n_steps,
+        train_loop_shape=v2.TrainLoopShape(
+            n_train_envs=n_envs,
+            n_steps=n_steps,
+            n_minibatches=SMALL_CONFIG["n_minibatches"],
+            n_ppo_epochs=SMALL_CONFIG["n_ppo_epochs"],
+            n_updates=1,
+            eval_freq=1,
+        ),
     )
 
     assert_allclose(np.array(last_value_1), np.array(last_value_2), rtol=1e-5)
@@ -168,6 +175,14 @@ def test_update_actor_critic_rnn(env_and_state):
         entropy_coeff=SMALL_CONFIG["entropy_coeff"],
         critic_coeff=SMALL_CONFIG["critic_coeff"],
     )
+    train_loop_shape = v2.TrainLoopShape(
+        n_train_envs=n_envs,
+        n_steps=n_steps,
+        n_minibatches=SMALL_CONFIG["n_minibatches"],
+        n_ppo_epochs=SMALL_CONFIG["n_ppo_epochs"],
+        n_updates=1,
+        eval_freq=1,
+    )
     batch_v2 = v2.PPOUpdateBatch(
         obs=obs,
         action=actions,
@@ -179,9 +194,7 @@ def test_update_actor_critic_rnn(env_and_state):
     )
     (rng2, ts2), losses2 = v2.update_actor_critic_rnn(
         rng_update, train_state, train_state.last_hstate, batch_v2, hparams,
-        n_envs=n_envs, n_steps=n_steps,
-        n_minibatches=SMALL_CONFIG["n_minibatches"],
-        n_ppo_epochs=SMALL_CONFIG["n_ppo_epochs"],
+        train_loop_shape=train_loop_shape,
     )
 
     loss1, (vf1, clip1, ent1) = losses1
