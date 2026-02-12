@@ -9,6 +9,41 @@ import sys
 from pathlib import Path
 
 
+def _parser_dest_names(parser):
+    """Return all argparse destination names defined on a parser."""
+    return {action.dest for action in parser._actions}
+
+
+def _apply_legacy_key_map(yaml_config, legacy_key_map):
+    """Translate legacy YAML keys to parser keys and fail on ambiguous duplicates."""
+    translated_config = dict(yaml_config)
+    for legacy_key, canonical_key in legacy_key_map.items():
+        if legacy_key not in translated_config:
+            continue
+        legacy_value = translated_config.pop(legacy_key)
+        if canonical_key in translated_config and translated_config[canonical_key] != legacy_value:
+            print(
+                "ERROR: Config sets both legacy key "
+                f"'{legacy_key}' and canonical key '{canonical_key}' with different values."
+            )
+            sys.exit(1)
+        translated_config.setdefault(canonical_key, legacy_value)
+    return translated_config
+
+
+def _reject_unknown_yaml_keys(parser, yaml_config):
+    """Fail fast when YAML contains keys not defined by the argument parser."""
+    valid_keys = _parser_dest_names(parser)
+    unknown_keys = sorted(set(yaml_config) - valid_keys)
+    if unknown_keys:
+        print(
+            "ERROR: Unknown config keys: "
+            + ", ".join(unknown_keys)
+            + ". Update the YAML keys or add a legacy key mapping."
+        )
+        sys.exit(1)
+
+
 def struct_from_dict(cls, d):
     """Construct a Flax struct dataclass from a flat dict.
 
@@ -26,7 +61,7 @@ def struct_from_dict(cls, d):
     return cls(**{k: d[k] for k in field_names if k in d})
 
 
-def load_config(parser):
+def load_config(parser, legacy_key_map=None, reject_unknown_yaml_keys=False):
     """Load config from YAML file with CLI overrides.
 
     Adds --config and --force args to parser, loads YAML if provided,
@@ -35,6 +70,8 @@ def load_config(parser):
 
     Args:
         parser: argparse.ArgumentParser with experiment arguments defined
+        legacy_key_map: Optional mapping from old YAML keys to current parser keys
+        reject_unknown_yaml_keys: Whether to fail when YAML includes unsupported keys
 
     Returns:
         dict: Final config with all values resolved
@@ -56,6 +93,9 @@ def load_config(parser):
 
     if args.config is not None:
         yaml_config = _load_yaml(args.config)
+        yaml_config = _apply_legacy_key_map(yaml_config, legacy_key_map or {})
+        if reject_unknown_yaml_keys:
+            _reject_unknown_yaml_keys(parser, yaml_config)
 
         # Set YAML values as defaults (CLI args will override)
         parser.set_defaults(**yaml_config)

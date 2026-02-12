@@ -35,6 +35,16 @@ WANDB_METRIC_PATTERNS = (
     "eval_ep_lengths/*",
 )
 
+LEGACY_YAML_KEY_MAP = {
+    "eval_num_attempts": "n_eval_attempts",
+    "num_updates": "n_updates",
+    "num_env_steps": "n_env_steps",
+    "num_steps": "n_steps",
+    "num_train_envs": "n_train_envs",
+    "num_minibatches": "n_minibatches",
+    "epoch_ppo": "n_ppo_epochs",
+}
+
 
 class Trajectory(NamedTuple):
     obs: chex.ArrayTree
@@ -1316,6 +1326,10 @@ def build_argument_parser():
 
 if __name__ == "__main__":
     parser = build_argument_parser()
-    config = load_config(parser)
+    config = load_config(
+        parser,
+        legacy_key_map=LEGACY_YAML_KEY_MAP,
+        reject_unknown_yaml_keys=True,
+    )
     config = normalize_run_config(config)
     main(config, project=config["project"])
