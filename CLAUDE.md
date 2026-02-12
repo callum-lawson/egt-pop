@@ -45,8 +45,10 @@ python examples/maze_plr.py --mode eval --checkpoint_directory=./checkpoints/<ru
 
 ### Testing
 ```bash
-pytest -v -s                          # Run tests
-WANDB_MODE=disabled pytest            # Run without wandb
+./.venv/bin/python -m pytest -v -s   # Run tests
+WANDB_MODE=disabled ./.venv/bin/python -m pytest   # Run without wandb
+WANDB_MODE=disabled ./.venv/bin/python -m pytest tests/test_dr_equivalence.py -q  # Fast DR v1/v2 equivalence checks
+RUN_SLOW_EQUIVALENCE_TESTS=1 WANDB_MODE=disabled ./.venv/bin/python -m pytest tests/test_dr_equivalence.py -q -k "runtime_is_within_tolerance or tensor_footprint"  # Optional slower compute-equivalence checks
 ```
 
 ## Architecture

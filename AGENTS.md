@@ -14,6 +14,8 @@ in `configs/*.yaml`. Documentation source is in `docs/` with MkDocs config in `m
 - `./.venv/bin/python -m pytest -q`: quick test run.
 - `WANDB_MODE=disabled ./.venv/bin/python -m pytest -v -s`: run tests without Weights & Biases logging side effects.
 - `WANDB_MODE=disabled ./.venv/bin/python -m pytest tests/test_dr_equivalence.py -v -s`: run DR v1/v2 equivalence test.
+- `WANDB_MODE=disabled ./.venv/bin/python -m pytest tests/test_dr_equivalence.py -q`: run fast DR v1/v2 equivalence checks (default suite).
+- `RUN_SLOW_EQUIVALENCE_TESTS=1 WANDB_MODE=disabled ./.venv/bin/python -m pytest tests/test_dr_equivalence.py -q -k "runtime_is_within_tolerance or tensor_footprint"`: run optional slower DR compute-equivalence checks.
 - In sandboxed runs, JAX may log CUDA plugin initialization warnings and then fall back to CPU; this is expected and not a test failure by itself.
 - `tox`: run tests across supported Python versions defined in `tox.ini`.
 - `./.venv/bin/python examples/maze_plr.py` (or other scripts in `examples/`): run training entrypoints.
