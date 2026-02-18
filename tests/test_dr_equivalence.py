@@ -73,6 +73,17 @@ def _assert_tree_allclose(tree1, tree2, *, rtol=1e-5, atol=1e-8):
         assert_allclose(np.asarray(leaf1), np.asarray(leaf2), rtol=rtol, atol=atol)
 
 
+def _assert_train_state_update_outputs_match(state1, state2, *, rtol=1e-5):
+    """Assert update outputs that should be numerically equivalent across implementations."""
+    assert state1.step == state2.step
+    assert state1.update_count == state2.update_count
+    _assert_tree_allclose(state1.params, state2.params, rtol=rtol)
+    _assert_tree_allclose(state1.opt_state, state2.opt_state, rtol=rtol)
+    _assert_tree_allclose(state1.last_hstate, state2.last_hstate, rtol=rtol)
+    _assert_tree_allclose(state1.last_obs, state2.last_obs, rtol=rtol)
+    _assert_tree_allclose(state1.last_env_state, state2.last_env_state, rtol=rtol)
+
+
 def _block_tree(tree):
     """Block on all leaves in a pytree."""
     jax.tree_util.tree_map(
@@ -186,7 +197,7 @@ def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
     n_envs = SMALL_CONFIG["n_train_envs"]
     n_steps = SMALL_CONFIG["n_steps"]
 
-    (_, _, _, _, _, last_value_1), traj1 = v1.sample_trajectories_rnn(
+    (_, _, hstate1, last_obs1, last_env_state1, last_value_1), traj1 = v1.sample_trajectories_rnn(
         rng, env, env_params, train_state,
         train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
         n_envs, n_steps,
@@ -217,6 +228,12 @@ def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
     assert_allclose(np.array(v1_done), np.array(traj2.done))
     assert_allclose(np.array(v1_log_prob), np.array(traj2.log_prob), rtol=1e-5)
     assert_allclose(np.array(v1_value), np.array(traj2.value), rtol=1e-5)
+    _assert_tree_allclose(traj1[-1], traj2.info, rtol=1e-5)
+
+    _assert_tree_allclose(hstate1, rollout_state.hidden_state, rtol=1e-5)
+    _assert_tree_allclose(last_obs1, rollout_state.obs, rtol=1e-5)
+    _assert_tree_allclose(last_env_state1, rollout_state.env_state, rtol=1e-5)
+    assert_allclose(np.asarray(v1_done[-1]), np.asarray(rollout_state.done))
 
 
 def test_update_actor_critic_rnn(env_and_state):
@@ -283,10 +300,7 @@ def test_update_actor_critic_rnn(env_and_state):
     assert_allclose(np.array(ent1), np.array(ent2), rtol=1e-5)
 
     assert_allclose(np.array(rng1), np.array(rng2))
-    for p1, p2 in zip(jax.tree_util.tree_leaves(ts1.params), jax.tree_util.tree_leaves(ts2.params)):
-        assert_allclose(np.array(p1), np.array(p2), rtol=1e-5)
-    for l1, l2 in zip(jax.tree_util.tree_leaves(ts1.opt_state), jax.tree_util.tree_leaves(ts2.opt_state)):
-        assert_allclose(np.array(l1), np.array(l2), rtol=1e-5)
+    _assert_train_state_update_outputs_match(ts1, ts2, rtol=1e-5)
 
 
 def test_prepare_rnn_ppo_batch_done_shift_matches_v1():
