@@ -147,6 +147,29 @@ class TrainState(BaseTrainState):
     last_env_snapshot: EnvSnapshot
 
 
+def _dense(features, scale, name):
+    return nn.Dense(features, kernel_init=orthogonal(scale), bias_init=constant(0.0), name=name)
+
+
+def _encode_maze_obs(obs: Observation, network_config: NetworkConfig) -> chex.Array:
+    img_embed = nn.Conv(
+        network_config.conv_filters,
+        kernel_size=(3, 3),
+        strides=(1, 1),
+        padding="VALID",
+    )(obs.image)
+    img_embed = nn.relu(img_embed.reshape(*img_embed.shape[:-3], -1))
+
+    dir_embed = nn.Dense(
+        network_config.direction_embed_dim,
+        kernel_init=orthogonal(np.sqrt(2)),
+        bias_init=constant(0.0),
+        name="scalar_embed",
+    )(jax.nn.one_hot(obs.agent_dir, 4))
+
+    return jnp.concatenate([img_embed, dir_embed], axis=-1)
+
+
 class ActorCritic(nn.Module):
     """Actor-critic with LSTM."""
     action_dim: Sequence[int]
@@ -156,57 +179,18 @@ class ActorCritic(nn.Module):
     def __call__(self, inputs, policy_carry):
         obs, dones = inputs
 
-        img_embed = nn.Conv(
-            self.network_config.conv_filters,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-        )(obs.image)
-        img_embed = img_embed.reshape(*img_embed.shape[:-3], -1)
-        img_embed = nn.relu(img_embed)
-
-        dir_embed = jax.nn.one_hot(obs.agent_dir, 4)
-        dir_embed = nn.Dense(
-            self.network_config.direction_embed_dim,
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-            name="scalar_embed",
-        )(dir_embed)
-
-        embedding = jnp.append(img_embed, dir_embed, axis=-1)
+        embedding = _encode_maze_obs(obs, self.network_config)
 
         policy_carry, embedding = ResetRNN(
             nn.OptimizedLSTMCell(features=self.network_config.lstm_features)
         )((embedding, dones), initial_carry=policy_carry)
 
-        actor_mean = nn.Dense(
-            self.network_config.hidden_dim,
-            kernel_init=orthogonal(2),
-            bias_init=constant(0.0),
-            name="actor0",
-        )(embedding)
-        actor_mean = nn.relu(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim,
-            kernel_init=orthogonal(0.01),
-            bias_init=constant(0.0),
-            name="actor1",
-        )(actor_mean)
-        policy_distribution = distrax.Categorical(logits=actor_mean)
+        actor_logits = nn.relu(_dense(self.network_config.hidden_dim, 2, "actor0")(embedding))
+        actor_logits = _dense(self.action_dim, 0.01, "actor1")(actor_logits)
+        policy_distribution = distrax.Categorical(logits=actor_logits)
 
-        critic = nn.Dense(
-            self.network_config.hidden_dim,
-            kernel_init=orthogonal(2),
-            bias_init=constant(0.0),
-            name="critic0",
-        )(embedding)
-        critic = nn.relu(critic)
-        critic = nn.Dense(
-            1,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-            name="critic1",
-        )(critic)
+        critic = nn.relu(_dense(self.network_config.hidden_dim, 2, "critic0")(embedding))
+        critic = _dense(1, 1.0, "critic1")(critic)
 
         return policy_carry, policy_distribution, jnp.squeeze(critic, axis=-1)
 
