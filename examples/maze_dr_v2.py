@@ -113,8 +113,7 @@ class PPOUpdateBatch(NamedTuple):
     advantages: chex.Array
 
 
-class RolloutState(NamedTuple):
-    hidden_state: chex.ArrayTree
+class EnvSnapshot(NamedTuple):
     obs: Observation
     env_state: EnvState
     done: chex.Array
@@ -144,9 +143,8 @@ class EnvComponents(NamedTuple):
 
 class TrainState(BaseTrainState):
     update_count: int
-    last_hstate: chex.ArrayTree
-    last_obs: chex.ArrayTree
-    last_env_state: chex.ArrayTree
+    last_policy_carry: chex.ArrayTree
+    last_env_snapshot: EnvSnapshot
 
 
 class ActorCritic(nn.Module):
@@ -155,7 +153,7 @@ class ActorCritic(nn.Module):
     network_config: NetworkConfig
 
     @nn.compact
-    def __call__(self, inputs, hidden_state):
+    def __call__(self, inputs, policy_carry):
         obs, dones = inputs
 
         img_embed = nn.Conv(
@@ -177,9 +175,9 @@ class ActorCritic(nn.Module):
 
         embedding = jnp.append(img_embed, dir_embed, axis=-1)
 
-        hidden_state, embedding = ResetRNN(
+        policy_carry, embedding = ResetRNN(
             nn.OptimizedLSTMCell(features=self.network_config.lstm_features)
-        )((embedding, dones), initial_carry=hidden_state)
+        )((embedding, dones), initial_carry=policy_carry)
 
         actor_mean = nn.Dense(
             self.network_config.hidden_dim,
@@ -210,13 +208,13 @@ class ActorCritic(nn.Module):
             name="critic1",
         )(critic)
 
-        return hidden_state, policy_distribution, jnp.squeeze(critic, axis=-1)
+        return policy_carry, policy_distribution, jnp.squeeze(critic, axis=-1)
 
     @staticmethod
-    def initialize_carry(batch_dims, lstm_features: int):
-        return nn.OptimizedLSTMCell(features=lstm_features).initialize_carry(
+    def initialize_carry(batch_dims, network_config: NetworkConfig):
+        return nn.OptimizedLSTMCell(features=network_config.lstm_features).initialize_carry(
             jax.random.PRNGKey(0),
-            (*batch_dims, lstm_features),
+            (*batch_dims, network_config.lstm_features),
         )
 
 
@@ -243,30 +241,29 @@ def compute_gae(
     return advantages, advantages + trajectory.value
 
 
-def rollout_training_trajectories_rnn(
+def rollout_training_trajectories(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hidden_state: chex.ArrayTree,
-    init_obs: Observation,
-    init_env_state: EnvState,
+    init_policy_carry: chex.ArrayTree,
+    init_env_snapshot: EnvSnapshot,
     *,
     env: UnderspecifiedEnv,
     env_params: EnvParams,
     train_loop_shape: TrainLoopShape,
-) -> Tuple[Tuple[chex.PRNGKey, TrainState, RolloutState], Trajectory]:
+) -> Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, EnvSnapshot], Trajectory]:
     """Collect PPO training trajectories and return the next rollout state."""
     n_train_envs = train_loop_shape.n_train_envs
     n_steps = train_loop_shape.n_steps
 
     def sample_step(carry, _):
-        rng, train_state, rollout_state = carry
+        rng, train_state, policy_carry, env_snapshot = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        policy_inputs = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
-        next_hidden_state, policy_distribution, value = train_state.apply_fn(
+        policy_inputs = jax.tree.map(lambda t: t[None, ...], (env_snapshot.obs, env_snapshot.done))
+        next_policy_carry, policy_distribution, value = train_state.apply_fn(
             train_state.params,
             policy_inputs,
-            rollout_state.hidden_state,
+            policy_carry,
         )
         action = policy_distribution.sample(seed=rng_action)
         log_prob = policy_distribution.log_prob(action)
@@ -279,87 +276,85 @@ def rollout_training_trajectories_rnn(
         step_keys = jax.random.split(rng_step, n_train_envs)
         next_obs, env_state, reward, done, info = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(step_keys, rollout_state.env_state, action, env_params)
+        )(step_keys, env_snapshot.env_state, action, env_params)
 
-        next_rollout_state = RolloutState(next_hidden_state, next_obs, env_state, done)
-        carry = (rng, train_state, next_rollout_state)
-        return carry, Trajectory(rollout_state.obs, action, reward, done, log_prob, value, info)
+        next_env_snapshot = EnvSnapshot(next_obs, env_state, done)
+        carry = (rng, train_state, next_policy_carry, next_env_snapshot)
+        return carry, Trajectory(env_snapshot.obs, action, reward, done, log_prob, value, info)
 
-    init_rollout_state = RolloutState(
-        init_hidden_state,
-        init_obs,
-        init_env_state,
-        jnp.zeros(n_train_envs, dtype=bool),
+    init_env_snapshot = EnvSnapshot(
+        obs=init_env_snapshot.obs,
+        env_state=init_env_snapshot.env_state,
+        done=jnp.zeros(n_train_envs, dtype=bool),
     )
-    (rng, train_state, rollout_state), trajectory = jax.lax.scan(
+    (rng, train_state, policy_carry, env_snapshot), trajectory = jax.lax.scan(
         sample_step,
-        (rng, train_state, init_rollout_state),
+        (rng, train_state, init_policy_carry, init_env_snapshot),
         None,
         length=n_steps,
     )
 
-    return (rng, train_state, rollout_state), trajectory
+    return (rng, train_state, policy_carry, env_snapshot), trajectory
 
 
 def compute_bootstrap_value(
     train_state: TrainState,
-    rollout_state: RolloutState,
+    policy_carry: chex.ArrayTree,
+    env_snapshot: EnvSnapshot,
 ) -> chex.Array:
     """Compute the bootstrap value from a rollout state's final observation."""
-    policy_inputs = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
-    _, _, last_value = train_state.apply_fn(train_state.params, policy_inputs, rollout_state.hidden_state)
+    policy_inputs = jax.tree.map(lambda t: t[None, ...], (env_snapshot.obs, env_snapshot.done))
+    _, _, last_value = train_state.apply_fn(train_state.params, policy_inputs, policy_carry)
     return last_value.squeeze(0)
 
 
-def rollout_eval_episodes_rnn(
+def rollout_eval_episodes(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hidden_state: chex.ArrayTree,
-    init_obs: Observation,
-    init_env_state: EnvState,
+    init_policy_carry: chex.ArrayTree,
+    init_env_snapshot: EnvSnapshot,
     *,
     env: UnderspecifiedEnv,
     env_params: EnvParams,
     max_episode_length: int,
 ) -> Tuple[chex.Array, chex.Array, chex.Array]:
     """Roll out evaluation episodes to produce states, rewards, and episode lengths for metrics."""
-    first_obs_leaf = jax.tree.leaves(init_obs)[0]
+    first_obs_leaf = jax.tree.leaves(init_env_snapshot.obs)[0]
     n_levels = first_obs_leaf.shape[0]
 
     def step(carry, _):
-        rng, rollout_state, mask, episode_length = carry
+        rng, policy_carry, env_snapshot, mask, episode_length = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
 
-        policy_inputs = jax.tree.map(lambda t: t[None, ...], (rollout_state.obs, rollout_state.done))
-        next_hidden_state, policy_distribution, _ = train_state.apply_fn(
+        policy_inputs = jax.tree.map(lambda t: t[None, ...], (env_snapshot.obs, env_snapshot.done))
+        next_policy_carry, policy_distribution, _ = train_state.apply_fn(
             train_state.params,
             policy_inputs,
-            rollout_state.hidden_state,
+            policy_carry,
         )
         action = policy_distribution.sample(seed=rng_action).squeeze(0)
 
         step_keys = jax.random.split(rng_step, n_levels)
         obs, next_state, reward, done, _ = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
-        )(step_keys, rollout_state.env_state, action, env_params)
+        )(step_keys, env_snapshot.env_state, action, env_params)
 
         next_mask = mask & ~done
         episode_length += mask
 
-        next_rollout_state = RolloutState(next_hidden_state, obs, next_state, done)
-        return (rng, next_rollout_state, next_mask, episode_length), (rollout_state.env_state, reward)
+        next_env_snapshot = EnvSnapshot(obs, next_state, done)
+        return (rng, next_policy_carry, next_env_snapshot, next_mask, episode_length), (env_snapshot.env_state, reward)
 
-    init_rollout_state = RolloutState(
-        init_hidden_state,
-        init_obs,
-        init_env_state,
-        jnp.zeros(n_levels, dtype=bool),
+    init_env_snapshot = EnvSnapshot(
+        obs=init_env_snapshot.obs,
+        env_state=init_env_snapshot.env_state,
+        done=jnp.zeros(n_levels, dtype=bool),
     )
     initial_mask = jnp.ones(n_levels, dtype=bool)
     initial_episode_length = jnp.zeros(n_levels, dtype=jnp.int32)
-    (_, _, _, episode_lengths), (states, rewards) = jax.lax.scan(
+    (_, _, _, _, episode_lengths), (states, rewards) = jax.lax.scan(
         step,
-        (rng, init_rollout_state, initial_mask, initial_episode_length),
+        (rng, init_policy_carry, init_env_snapshot, initial_mask, initial_episode_length),
         None,
         length=max_episode_length,
     )
@@ -395,20 +390,20 @@ def build_ppo_update_batch(
     )
 
 
-def build_rnn_minibatches(
-    init_hidden_state: chex.ArrayTree,
+def build_minibatches(
+    init_policy_carry: chex.ArrayTree,
     batch: PPOUpdateBatch,
     permutation: chex.Array,
     n_minibatches: int,
 ) -> Tuple[chex.ArrayTree, ...]:
     """Build shuffled rollout minibatches for recurrent PPO updates."""
-    minibatched_init_hidden_state = jax.tree.map(
+    minibatched_init_policy_carry = jax.tree.map(
         lambda x: jnp.take(x, permutation, axis=0).reshape(
             n_minibatches,
             -1,
             *x.shape[1:],
         ),
-        init_hidden_state,
+        init_policy_carry,
     )
 
     minibatched_batch = jax.tree.map(
@@ -418,22 +413,22 @@ def build_rnn_minibatches(
         batch,
     )
 
-    return (minibatched_init_hidden_state, *minibatched_batch)
+    return (minibatched_init_policy_carry, *minibatched_batch)
 
 
-def prepare_rnn_ppo_batch(batch: PPOUpdateBatch) -> PPOUpdateBatch:
+def prepare_ppo_batch(batch: PPOUpdateBatch) -> PPOUpdateBatch:
     """Shift done flags to align recurrent PPO inputs with previous-step termination."""
     shifted_done = jnp.roll(batch.done, 1, axis=0).at[0].set(False)
     return batch._replace(done=shifted_done)
 
 
-def compute_rnn_ppo_loss_and_grads(
+def compute_ppo_loss_and_grads(
     train_state: TrainState,
     minibatch: Tuple[chex.ArrayTree, ...],
     hparams: PPOHyperparams,
 ):
     """Compute PPO minibatch losses and gradients for the current training state."""
-    init_hidden_state, obs, action, done, log_prob, value, targets, advantages = minibatch
+    init_policy_carry, obs, action, done, log_prob, value, targets, advantages = minibatch
     clip_eps = hparams.clip_eps
     entropy_coeff = hparams.entropy_coeff
     critic_coeff = hparams.critic_coeff
@@ -442,7 +437,7 @@ def compute_rnn_ppo_loss_and_grads(
         _, policy_distribution, value_pred = train_state.apply_fn(
             params,
             (obs, done),
-            init_hidden_state,
+            init_policy_carry,
         )
         log_prob_pred = policy_distribution.log_prob(action)
         entropy = policy_distribution.entropy().mean()
@@ -468,10 +463,10 @@ def compute_rnn_ppo_loss_and_grads(
     return loss, grads
 
 
-def run_rnn_ppo_epochs(
+def run_ppo_epochs(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hidden_state: chex.ArrayTree,
+    init_policy_carry: chex.ArrayTree,
     batch: PPOUpdateBatch,
     hparams: PPOHyperparams,
     *,
@@ -483,7 +478,7 @@ def run_rnn_ppo_epochs(
     n_ppo_epochs = train_loop_shape.n_ppo_epochs
 
     def update_minibatch(train_state, minibatch):
-        loss, grads = compute_rnn_ppo_loss_and_grads(train_state, minibatch, hparams)
+        loss, grads = compute_ppo_loss_and_grads(train_state, minibatch, hparams)
         train_state = train_state.apply_gradients(grads=grads)
         return train_state, loss
 
@@ -492,8 +487,8 @@ def run_rnn_ppo_epochs(
         rng, rng_perm = jax.random.split(rng)
         permutation = jax.random.permutation(rng_perm, n_train_envs)
 
-        minibatches = build_rnn_minibatches(
-            init_hidden_state,
+        minibatches = build_minibatches(
+            init_policy_carry,
             batch,
             permutation,
             n_minibatches,
@@ -504,21 +499,21 @@ def run_rnn_ppo_epochs(
     return jax.lax.scan(update_epoch, (rng, train_state), None, n_ppo_epochs)
 
 
-def update_actor_critic_rnn(
+def update_actor_critic(
     rng: chex.PRNGKey,
     train_state: TrainState,
-    init_hidden_state: chex.ArrayTree,
+    init_policy_carry: chex.ArrayTree,
     batch: PPOUpdateBatch,
     hparams: PPOHyperparams,
     *,
     train_loop_shape: TrainLoopShape,
 ) -> Tuple[Tuple[chex.PRNGKey, TrainState], chex.ArrayTree]:
     """Run recurrent PPO actor-critic updates over rollout minibatches."""
-    prepared_batch = prepare_rnn_ppo_batch(batch)
-    return run_rnn_ppo_epochs(
+    prepared_batch = prepare_ppo_batch(batch)
+    return run_ppo_epochs(
         rng,
         train_state,
-        init_hidden_state,
+        init_policy_carry,
         prepared_batch,
         hparams,
         train_loop_shape=train_loop_shape,
@@ -831,9 +826,9 @@ def create_train_state(
 ) -> TrainState:
     """Create a fresh TrainState from initialized network, optimizer, and environment carry."""
     n_train_envs = train_loop_shape.n_train_envs
-    initial_hidden_state = ActorCritic.initialize_carry(
+    initial_policy_carry = ActorCritic.initialize_carry(
         (n_train_envs,),
-        network_config.lstm_features,
+        network_config,
     )
 
     rng, rng_network_init = jax.random.split(rng)
@@ -844,7 +839,7 @@ def create_train_state(
         sample_random_level=sample_random_level,
         n_train_envs=n_train_envs,
         network_config=network_config,
-        initial_hidden_state=initial_hidden_state,
+        initial_policy_carry=initial_policy_carry,
     )
     optimizer = build_optimizer(
         optimizer_config=optimizer_config,
@@ -865,9 +860,12 @@ def create_train_state(
         params=network_params,
         tx=optimizer,
         update_count=0,
-        last_hstate=initial_hidden_state,
-        last_obs=init_obs,
-        last_env_state=init_env_state,
+        last_policy_carry=initial_policy_carry,
+        last_env_snapshot=EnvSnapshot(
+            obs=init_obs,
+            env_state=init_env_state,
+            done=jnp.zeros(n_train_envs, dtype=bool),
+        ),
     )
 
 
@@ -911,11 +909,11 @@ def initialize_actor_critic_network(
     sample_random_level,
     n_train_envs: int,
     network_config: NetworkConfig,
-    initial_hidden_state: chex.ArrayTree,
+    initial_policy_carry: chex.ArrayTree,
 ):
     """Initialize the actor-critic network and return the module with initialized parameters."""
     obs, _ = env.reset_to_level(rng_network_init, sample_random_level(rng_network_init), env_params)
-    init_sequence_length = network_config.lstm_features
+    init_sequence_length = 1
     sequence_batched_obs, init_done = build_network_init_inputs(
         obs,
         n_train_envs=n_train_envs,
@@ -926,7 +924,7 @@ def initialize_actor_critic_network(
     network_params = network.init(
         rng_network_init,
         network_init_inputs,
-        initial_hidden_state,
+        initial_policy_carry,
     )
     return network, network_params
 
@@ -966,24 +964,23 @@ def train_step(
     """Run one PPO training recipe from rollout collection through actor-critic update."""
     rng, train_state = carry
 
-    (rng, train_state, rollout_state), trajectory = rollout_training_trajectories_rnn(
+    (rng, train_state, policy_carry, env_snapshot), trajectory = rollout_training_trajectories(
         rng,
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot,
         env=env,
         env_params=env_params,
         train_loop_shape=train_loop_shape,
     )
-    last_value = compute_bootstrap_value(train_state, rollout_state)
+    last_value = compute_bootstrap_value(train_state, policy_carry, env_snapshot)
     advantages, targets = compute_gae(hparams, last_value, trajectory)
     ppo_update_batch = build_ppo_update_batch(trajectory, targets, advantages)
 
-    (rng, train_state), losses = update_actor_critic_rnn(
+    (rng, train_state), losses = update_actor_critic(
         rng,
         train_state,
-        train_state.last_hstate,
+        train_state.last_policy_carry,
         ppo_update_batch,
         hparams,
         train_loop_shape=train_loop_shape,
@@ -995,9 +992,8 @@ def train_step(
 
     train_state = train_state.replace(
         update_count=train_state.update_count + 1,
-        last_hstate=rollout_state.hidden_state,
-        last_env_state=rollout_state.env_state,
-        last_obs=rollout_state.obs,
+        last_policy_carry=policy_carry,
+        last_env_snapshot=env_snapshot,
     )
     return (rng, train_state), metrics
 
@@ -1021,16 +1017,20 @@ def eval_policy(
         levels,
         env_params,
     )
-    initial_eval_hidden_state = ActorCritic.initialize_carry(
+    initial_eval_policy_carry = ActorCritic.initialize_carry(
         (n_levels,),
-        network_config.lstm_features,
+        network_config,
     )
-    states, rewards, episode_lengths = rollout_eval_episodes_rnn(
+    init_env_snapshot = EnvSnapshot(
+        obs=init_obs,
+        env_state=init_env_state,
+        done=jnp.zeros(n_levels, dtype=bool),
+    )
+    states, rewards, episode_lengths = rollout_eval_episodes(
         rng,
         train_state,
-        initial_eval_hidden_state,
-        init_obs,
-        init_env_state,
+        initial_eval_policy_carry,
+        init_env_snapshot,
         env=eval_env,
         env_params=env_params,
         max_episode_length=env_params.max_steps_in_episode,

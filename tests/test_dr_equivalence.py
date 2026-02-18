@@ -2,8 +2,8 @@
 
 Compares the three core computational functions:
 - compute_gae: GAE advantage estimation
-- rollout_training_trajectories_rnn: rollout collection
-- update_actor_critic_rnn: PPO parameter update
+- rollout_training_trajectories: rollout collection
+- update_actor_critic: PPO parameter update
 """
 
 from functools import partial
@@ -79,9 +79,8 @@ def _assert_train_state_update_outputs_match(state1, state2, *, rtol=1e-5):
     assert state1.update_count == state2.update_count
     _assert_tree_allclose(state1.params, state2.params, rtol=rtol)
     _assert_tree_allclose(state1.opt_state, state2.opt_state, rtol=rtol)
-    _assert_tree_allclose(state1.last_hstate, state2.last_hstate, rtol=rtol)
-    _assert_tree_allclose(state1.last_obs, state2.last_obs, rtol=rtol)
-    _assert_tree_allclose(state1.last_env_state, state2.last_env_state, rtol=rtol)
+    _assert_tree_allclose(state1.last_policy_carry, state2.last_policy_carry, rtol=rtol)
+    _assert_tree_allclose(state1.last_env_snapshot, state2.last_env_snapshot, rtol=rtol)
 
 
 def _block_tree(tree):
@@ -105,9 +104,9 @@ def _run_v1_train_step(rng, env, env_params, train_state):
         env,
         env_params,
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot.obs,
+        train_state.last_env_snapshot.env_state,
         n_envs,
         n_steps,
     )
@@ -122,7 +121,7 @@ def _run_v1_train_step(rng, env, env_params, train_state):
     (rng, train_state), losses = v1.update_actor_critic_rnn(
         rng,
         train_state,
-        train_state.last_hstate,
+        train_state.last_policy_carry,
         (obs, actions, dones, log_probs, values, targets, advantages),
         n_envs,
         n_steps,
@@ -135,9 +134,12 @@ def _run_v1_train_step(rng, env, env_params, train_state):
     )
     train_state = train_state.replace(
         update_count=train_state.update_count + 1,
-        last_hstate=hstate,
-        last_env_state=last_env_state,
-        last_obs=last_obs,
+        last_policy_carry=hstate,
+        last_env_snapshot=v2.EnvSnapshot(
+            obs=last_obs,
+            env_state=last_env_state,
+            done=dones[-1],
+        ),
     )
     metrics = {"losses": jax.tree_util.tree_map(lambda x: x.mean(), losses)}
     return (rng, train_state), metrics
@@ -190,7 +192,7 @@ def test_compute_gae():
     assert_allclose(np.array(tgt1), np.array(tgt2), rtol=1e-5)
 
 
-def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
+def test_rollout_training_trajectories_and_bootstrap(env_and_state):
     """Rollout sampling and bootstrap value computation match v1 behavior."""
     env, env_params, train_state = env_and_state
     rng = jax.random.PRNGKey(7)
@@ -199,13 +201,15 @@ def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
 
     (_, _, hstate1, last_obs1, last_env_state1, last_value_1), traj1 = v1.sample_trajectories_rnn(
         rng, env, env_params, train_state,
-        train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot.obs,
+        train_state.last_env_snapshot.env_state,
         n_envs, n_steps,
     )
 
-    (_, _, rollout_state), traj2 = v2.rollout_training_trajectories_rnn(
+    (_, _, policy_carry, env_snapshot), traj2 = v2.rollout_training_trajectories(
         rng, train_state,
-        train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
+        train_state.last_policy_carry, train_state.last_env_snapshot,
         env=env, env_params=env_params,
         train_loop_shape=v2.TrainLoopShape(
             n_train_envs=n_envs,
@@ -216,7 +220,7 @@ def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
             eval_freq=1,
         ),
     )
-    last_value_2 = v2.compute_bootstrap_value(train_state, rollout_state)
+    last_value_2 = v2.compute_bootstrap_value(train_state, policy_carry, env_snapshot)
 
     assert_allclose(np.array(last_value_1), np.array(last_value_2), rtol=1e-5)
 
@@ -230,13 +234,13 @@ def test_rollout_training_trajectories_rnn_and_bootstrap(env_and_state):
     assert_allclose(np.array(v1_value), np.array(traj2.value), rtol=1e-5)
     _assert_tree_allclose(traj1[-1], traj2.info, rtol=1e-5)
 
-    _assert_tree_allclose(hstate1, rollout_state.hidden_state, rtol=1e-5)
-    _assert_tree_allclose(last_obs1, rollout_state.obs, rtol=1e-5)
-    _assert_tree_allclose(last_env_state1, rollout_state.env_state, rtol=1e-5)
-    assert_allclose(np.asarray(v1_done[-1]), np.asarray(rollout_state.done))
+    _assert_tree_allclose(hstate1, policy_carry, rtol=1e-5)
+    _assert_tree_allclose(last_obs1, env_snapshot.obs, rtol=1e-5)
+    _assert_tree_allclose(last_env_state1, env_snapshot.env_state, rtol=1e-5)
+    assert_allclose(np.asarray(v1_done[-1]), np.asarray(env_snapshot.done))
 
 
-def test_update_actor_critic_rnn(env_and_state):
+def test_update_actor_critic(env_and_state):
     """PPO update produces identical losses and params with both signatures."""
     env, env_params, train_state = env_and_state
     rng = jax.random.PRNGKey(7)
@@ -247,7 +251,9 @@ def test_update_actor_critic_rnn(env_and_state):
     (_, _, _, _, _, last_value), (obs, actions, rewards, dones, log_probs, values, info) = \
         v1.sample_trajectories_rnn(
             rng, env, env_params, train_state,
-            train_state.last_hstate, train_state.last_obs, train_state.last_env_state,
+            train_state.last_policy_carry,
+            train_state.last_env_snapshot.obs,
+            train_state.last_env_snapshot.env_state,
             n_envs, n_steps,
         )
     advantages, targets = v1.compute_gae(
@@ -259,7 +265,7 @@ def test_update_actor_critic_rnn(env_and_state):
     rng_update = jax.random.PRNGKey(99)
 
     (rng1, ts1), losses1 = v1.update_actor_critic_rnn(
-        rng_update, train_state, train_state.last_hstate, batch,
+        rng_update, train_state, train_state.last_policy_carry, batch,
         n_envs, n_steps,
         SMALL_CONFIG["n_minibatches"], SMALL_CONFIG["n_ppo_epochs"],
         SMALL_CONFIG["clip_eps"], SMALL_CONFIG["entropy_coeff"], SMALL_CONFIG["critic_coeff"],
@@ -287,8 +293,8 @@ def test_update_actor_critic_rnn(env_and_state):
         targets=targets,
         advantages=advantages,
     )
-    (rng2, ts2), losses2 = v2.update_actor_critic_rnn(
-        rng_update, train_state, train_state.last_hstate, batch_v2, hparams,
+    (rng2, ts2), losses2 = v2.update_actor_critic(
+        rng_update, train_state, train_state.last_policy_carry, batch_v2, hparams,
         train_loop_shape=train_loop_shape,
     )
 
@@ -303,7 +309,7 @@ def test_update_actor_critic_rnn(env_and_state):
     _assert_train_state_update_outputs_match(ts1, ts2, rtol=1e-5)
 
 
-def test_prepare_rnn_ppo_batch_done_shift_matches_v1():
+def test_prepare_ppo_batch_done_shift_matches_v1():
     """Done-flag shifting in v2 matches v1 PPO batch preparation."""
     rng = jax.random.PRNGKey(123)
     dones = jax.random.bernoulli(rng, 0.25, (11, 5)).astype(jnp.float32)
@@ -316,12 +322,12 @@ def test_prepare_rnn_ppo_batch_done_shift_matches_v1():
         targets=jnp.zeros((11, 5)),
         advantages=jnp.zeros((11, 5)),
     )
-    prepared = v2.prepare_rnn_ppo_batch(batch_v2)
+    prepared = v2.prepare_ppo_batch(batch_v2)
     shifted_v1 = jnp.roll(dones, 1, axis=0).at[0].set(False)
     assert_allclose(np.asarray(prepared.done), np.asarray(shifted_v1))
 
 
-def test_build_rnn_minibatches_matches_v1_logic(env_and_state):
+def test_build_minibatches_matches_v1_logic(env_and_state):
     """Minibatch shuffling and reshaping in v2 matches the v1 implementation."""
     _, _, train_state = env_and_state
     rng = jax.random.PRNGKey(456)
@@ -336,9 +342,9 @@ def test_build_rnn_minibatches_matches_v1_logic(env_and_state):
         env_and_state[0],
         env_and_state[1],
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot.obs,
+        train_state.last_env_snapshot.env_state,
         n_envs,
         n_steps,
     )
@@ -362,7 +368,7 @@ def test_build_rnn_minibatches_matches_v1_logic(env_and_state):
     expected = (
         jax.tree_util.tree_map(
             lambda x: jnp.take(x, permutation, axis=0).reshape(n_minibatches, -1, *x.shape[1:]),
-            train_state.last_hstate,
+            train_state.last_policy_carry,
         ),
         *jax.tree_util.tree_map(
             lambda x: jnp.take(x, permutation, axis=1)
@@ -371,7 +377,7 @@ def test_build_rnn_minibatches_matches_v1_logic(env_and_state):
             batch_v2,
         ),
     )
-    actual = v2.build_rnn_minibatches(train_state.last_hstate, batch_v2, permutation, n_minibatches)
+    actual = v2.build_minibatches(train_state.last_policy_carry, batch_v2, permutation, n_minibatches)
     _assert_tree_allclose(expected, actual, rtol=1e-6)
 
 
@@ -386,17 +392,21 @@ def test_eval_rollout_and_episode_returns_match_v1(env_and_state):
         env,
         env_params,
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot.obs,
+        train_state.last_env_snapshot.env_state,
         max_episode_length,
     )
-    states_v2, rewards_v2, ep_lengths_v2 = v2.rollout_eval_episodes_rnn(
+    init_env_snapshot = v2.EnvSnapshot(
+        obs=train_state.last_env_snapshot.obs,
+        env_state=train_state.last_env_snapshot.env_state,
+        done=jnp.zeros(SMALL_CONFIG["n_train_envs"], dtype=bool),
+    )
+    states_v2, rewards_v2, ep_lengths_v2 = v2.rollout_eval_episodes(
         rng,
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        init_env_snapshot,
         env=env,
         env_params=env_params,
         max_episode_length=max_episode_length,
@@ -445,9 +455,8 @@ def test_train_step_equivalence_with_aligned_rng(env_and_state):
     assert state_v1.update_count == state_v2.update_count
     _assert_tree_allclose(state_v1.params, state_v2.params, rtol=1e-5)
     _assert_tree_allclose(state_v1.opt_state, state_v2.opt_state, rtol=1e-5)
-    _assert_tree_allclose(state_v1.last_hstate, state_v2.last_hstate, rtol=1e-5)
-    _assert_tree_allclose(state_v1.last_obs, state_v2.last_obs, rtol=1e-5)
-    _assert_tree_allclose(state_v1.last_env_state, state_v2.last_env_state, rtol=1e-5)
+    _assert_tree_allclose(state_v1.last_policy_carry, state_v2.last_policy_carry, rtol=1e-5)
+    _assert_tree_allclose(state_v1.last_env_snapshot, state_v2.last_env_snapshot, rtol=1e-5)
     _assert_tree_allclose(metrics_v1["losses"], metrics_v2["losses"], rtol=1e-5)
 
 
@@ -477,9 +486,9 @@ def test_v2_rollout_update_runtime_is_within_tolerance(env_and_state):
             env,
             env_params,
             current_state,
-            current_state.last_hstate,
-            current_state.last_obs,
-            current_state.last_env_state,
+            current_state.last_policy_carry,
+            current_state.last_env_snapshot.obs,
+            current_state.last_env_snapshot.env_state,
             n_envs,
             n_steps,
         )
@@ -494,7 +503,7 @@ def test_v2_rollout_update_runtime_is_within_tolerance(env_and_state):
         (next_rng, next_state), losses = v1.update_actor_critic_rnn(
             rng,
             current_state,
-            current_state.last_hstate,
+            current_state.last_policy_carry,
             (obs, actions, dones, log_probs, values, targets, advantages),
             n_envs,
             n_steps,
@@ -508,23 +517,22 @@ def test_v2_rollout_update_runtime_is_within_tolerance(env_and_state):
 
     @jax.jit
     def v2_rollout_update_step(rng, current_state):
-        (_, _, rollout_state), trajectory = v2.rollout_training_trajectories_rnn(
+        (_, _, policy_carry, env_snapshot), trajectory = v2.rollout_training_trajectories(
             rng,
             current_state,
-            current_state.last_hstate,
-            current_state.last_obs,
-            current_state.last_env_state,
+            current_state.last_policy_carry,
+            current_state.last_env_snapshot,
             env=env,
             env_params=env_params,
             train_loop_shape=TRAIN_LOOP_SHAPE,
         )
-        last_value = v2.compute_bootstrap_value(current_state, rollout_state)
+        last_value = v2.compute_bootstrap_value(current_state, policy_carry, env_snapshot)
         advantages, targets = v2.compute_gae(hparams, last_value, trajectory)
         batch = v2.build_ppo_update_batch(trajectory, targets, advantages)
-        (next_rng, next_state), losses = v2.update_actor_critic_rnn(
+        (next_rng, next_state), losses = v2.update_actor_critic(
             rng,
             current_state,
-            current_state.last_hstate,
+            current_state.last_policy_carry,
             batch,
             hparams,
             train_loop_shape=TRAIN_LOOP_SHAPE,
@@ -565,23 +573,22 @@ def test_v2_rollout_update_tensor_footprint_matches_v1(env_and_state):
         env,
         env_params,
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot.obs,
+        train_state.last_env_snapshot.env_state,
         n_envs,
         n_steps,
     )
-    (_, _, rollout_state), traj2 = v2.rollout_training_trajectories_rnn(
+    (_, _, policy_carry, env_snapshot), traj2 = v2.rollout_training_trajectories(
         rng,
         train_state,
-        train_state.last_hstate,
-        train_state.last_obs,
-        train_state.last_env_state,
+        train_state.last_policy_carry,
+        train_state.last_env_snapshot,
         env=env,
         env_params=env_params,
         train_loop_shape=TRAIN_LOOP_SHAPE,
     )
-    _block_tree((traj1, traj2, rollout_state))
+    _block_tree((traj1, traj2, policy_carry, env_snapshot))
 
     traj1_bytes = _tree_bytes(traj1)
     traj2_bytes = _tree_bytes(traj2)
