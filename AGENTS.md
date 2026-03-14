@@ -101,3 +101,7 @@ Recent history uses short, imperative commit subjects (for example: `Add ...`, `
 - Refactor for readability instead (names, constants, small functions, types).
 - Comment only for **why** (perf/constraints) or to cite an algorithm/math source.
 - Use docstrings for public APIs (usage + expectations), not internal narration.
+
+## Shared Obsidian Vault
+- This workspace can access the shared Obsidian vault at `/mnt/c/Users/Callum/Documents/obsidian-notes/`.
+- Only use that vault when the user explicitly asks for it.

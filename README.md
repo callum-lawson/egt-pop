@@ -34,10 +34,6 @@ JaxUED is primarily intended for researchers looking to get *in the weeds* of UE
 ## Get Started
 See the [docs](https://dramacow.github.io/jaxued/) for more examples and [explanations of arguments](https://dramacow.github.io/jaxued/maze_dr/), or simply read the documented code in `examples/`
 
-### Shared Notes
-This workspace also has access to `obsidian-notes/` at `/mnt/c/Users/Callum/Documents/obsidian-notes`.
-Use this shared notes directory for exported analysis notes and related research writeups produced while working in this repo.
-
 ### Installation
 
 To install the core package:
